@@ -1,0 +1,86 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.hominluo.ostat-menus",
+  "name": "Ostat Menus",
+  "version": "1.0.0",
+  "author": "hominluo",
+  "license": "MIT",
+  "description": "Live CPU, memory, network, disk, GPU and temperature readout in the bar, with a full system-monitor panel.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Ostat Menus",
+    "description": "System resource monitor: bar readout plus a panel with CPU history, per-core load, memory composition, top processes, network and disk throughput, GPU and sensors.",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "items": [
+        "cpu",
+        "mem",
+        "net"
+      ],
+      "graph": true,
+      "interval": 2,
+      "activeInterval": 1,
+      "historySize": 60,
+      "monitorCommand": "omarchy-launch-or-focus-tui btop"
+    },
+    "schema": [
+      {
+        "key": "items",
+        "type": "array",
+        "label": "Bar readouts",
+        "description": "Which metrics appear in the bar, in order: cpu, mem, net, disk, gpu, temp.",
+        "defaultValue": [
+          "cpu",
+          "mem",
+          "net"
+        ]
+      },
+      {
+        "key": "graph",
+        "type": "boolean",
+        "label": "Show sparklines in the bar",
+        "defaultValue": true
+      },
+      {
+        "key": "interval",
+        "type": "number",
+        "label": "Sample interval when the panel is closed (seconds)",
+        "min": 0.5,
+        "max": 60,
+        "step": 0.5,
+        "defaultValue": 2
+      },
+      {
+        "key": "activeInterval",
+        "type": "number",
+        "label": "Sample interval while the panel is open (seconds)",
+        "min": 0.25,
+        "max": 10,
+        "step": 0.25,
+        "defaultValue": 1
+      },
+      {
+        "key": "historySize",
+        "type": "integer",
+        "label": "Samples kept for the graphs",
+        "min": 12,
+        "max": 240,
+        "step": 6,
+        "defaultValue": 60
+      },
+      {
+        "key": "monitorCommand",
+        "type": "string",
+        "label": "Command run by the footer button",
+        "defaultValue": "omarchy-launch-or-focus-tui btop"
+      }
+    ]
+  }
+}
