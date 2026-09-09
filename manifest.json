@@ -3,7 +3,7 @@
   "id": "io.github.hominluo.ostat-menus",
   "name": "Ostat Menus",
   "version": "1.0.0",
-  "author": "hominluo",
+  "author": "Homin Luo",
   "license": "MIT",
   "description": "Live CPU, memory, network, disk, GPU and temperature readout in the bar, with a full system-monitor panel.",
   "kinds": [

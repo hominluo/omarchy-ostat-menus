@@ -328,14 +328,21 @@ Panel {
       capacity: root.historySize
       values: cell.graphValues
       stroke: root.barForeground
-      // Idle machines sit near zero, where a 0-100 scale paints a flat line
-      // along the bottom edge that reads as an underscore, not a graph. The
-      // floor keeps a quiet minute quiet while still showing its shape.
-      autoScale: true
+      // CPU and GPU sit near zero most of the time, where a 0-100 scale paints
+      // a flat line along the bottom edge that reads as an underscore rather
+      // than a graph; the floor keeps a quiet minute quiet while still showing
+      // its shape. Memory is the opposite — a large, slow-moving figure that
+      // auto-scaling flattens into a solid filled block — so it keeps the
+      // absolute scale.
+      autoScale: cell.kind !== "mem"
       autoScaleFloor: 25
+      maxValue: 100
       gridLines: 0
-      fillAlpha: 0.22
-      strokeAlpha: 0.8
+      // Stroke only. In a 13px cell an area fill is mush, and for a figure
+      // that barely moves — memory sits at one level all day — filling under
+      // a flat line paints a solid block instead of a graph.
+      fillAlpha: 0
+      strokeAlpha: 0.85
       lineWidth: 1
     }
 
