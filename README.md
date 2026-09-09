@@ -181,3 +181,9 @@ edits show up immediately. `omarchy plugin validate .` checks the manifest.
 MIT — see [LICENSE](LICENSE).
 
 Not affiliated with Bjango or iStat Menus; the name is a nod, the code is not.
+
+---
+
+<p align="center">
+  Built by <a href="https://x.com/hominluo">@hominluo</a>
+</p>
