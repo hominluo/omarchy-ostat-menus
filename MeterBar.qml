@@ -53,17 +53,20 @@ Item {
     anchors.fill: parent
     spacing: 0
 
+    // Keyed on the count so a new segments array (one arrives with every
+    // sample) updates the existing rectangles and lets the width animate,
+    // instead of rebuilding them.
     Repeater {
-      model: root.segments
+      model: root.segments.length
 
       Rectangle {
-        required property var modelData
         required property int index
+        readonly property var segment: root.segments[index] || ({})
 
         height: root.height
-        width: Math.max(0, (modelData.fraction || 0) * root.width)
+        width: Math.max(0, (segment.fraction || 0) * root.width)
         color: Qt.rgba(root.fillColor.r, root.fillColor.g, root.fillColor.b,
-                       modelData.alpha === undefined ? root.fillAlpha : modelData.alpha)
+                       segment.alpha === undefined ? root.fillAlpha : segment.alpha)
         // Only the outer edges of the stack are rounded; rounding every
         // segment would leave notches where they meet.
         topLeftRadius: index === 0 ? root.height / 2 : 0

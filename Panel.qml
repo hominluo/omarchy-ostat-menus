@@ -38,7 +38,6 @@ Panel {
   property bool connected: false
   property string sensorError: ""
   property string processSort: "cpu"
-  property int cursorRow: -1
 
   property var cpuHistory: []
   property var memHistory: []
@@ -49,7 +48,6 @@ Panel {
   readonly property color foreground: bar ? bar.foreground : Color.foreground
   readonly property color urgent: bar ? bar.urgent : Color.urgent
   readonly property color dim: Qt.darker(foreground, 1.55)
-  readonly property color faint: Qt.rgba(foreground.r, foreground.g, foreground.b, 0.45)
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
   readonly property bool vertical: bar ? bar.vertical : false
   readonly property int barSize: bar ? bar.barSize : Style.bar.sizeHorizontal
@@ -75,7 +73,7 @@ Panel {
   // Absolute path to the sibling script. Deriving it from this file's own URL
   // means the plugin works from any directory — a git clone, a hand-made
   // folder, or a `omarchy plugin clone` copy under another name.
-  readonly property string sensorScript: String(Qt.resolvedUrl("sensors.py")).replace(/^file:\/\//, "")
+  readonly property string sensorScript: decodeURIComponent(String(Qt.resolvedUrl("sensors.py")).replace(/^file:\/\//, ""))
 
   // Both settings go out in ONE write. Two Process.write() calls in the same
   // event-loop turn do not both reach the child — the second is dropped — so
@@ -145,10 +143,14 @@ Panel {
 
   Component.onCompleted: sensors.running = true
 
+  // shell.json hot-reloads, so a changed interval has to reach the sampler
+  // that is already running; restarting it would drop the history.
+  onIdleIntervalChanged: pushSensorConfig()
+  onActiveIntervalChanged: pushSensorConfig()
+
   onOpenedChanged: {
     pushSensorConfig()
     if (opened) {
-      cursorRow = -1
       if (panelFlick) panelFlick.contentY = 0
       Qt.callLater(function() { keyCatcher.forceActiveFocus() })
     }
@@ -299,6 +301,13 @@ Panel {
       if (kind === "gpu") return root.gpuInfo ? Model.num(root.gpuInfo.busy) : 0
       return 0
     }
+    // The single-line figure. Temperature is the one non-rate metric that is
+    // not a percentage.
+    readonly property string valueText: {
+      if (!root.connected) return "··"
+      if (kind === "temp") return root.cpuTemp >= 0 ? Model.temperature(root.cpuTemp) : "–"
+      return Math.round(percentValue) + "%"
+    }
     readonly property var graphValues: {
       if (kind === "cpu") return root.cpuHistory
       if (kind === "mem") return root.memHistory
@@ -356,7 +365,7 @@ Panel {
       anchors.verticalCenter: parent.verticalCenter
       visible: !cell.isRatePair
       textFormat: Text.PlainText
-      text: root.connected ? Math.round(cell.percentValue) + "%" : "··"
+      text: cell.valueText
       color: root.barForeground
       font.family: root.fontFamily
       font.pixelSize: Style.font.bodySmall
@@ -569,12 +578,17 @@ Panel {
               anchors.verticalCenter: parent.verticalCenter
               spacing: coreCluster.gap
 
+              // Keyed on the count, not the array: a fresh array arrives with
+              // every sample, and a Repeater rebuilds its delegates whenever
+              // the model value changes, which would restart the height
+              // animation from zero each tick.
               Repeater {
-                model: root.cores
+                model: root.cores.length
 
                 Column {
-                  required property var modelData
+                  id: core
                   required property int index
+                  readonly property real load: Model.num(root.cores[index])
 
                   spacing: Style.space(3)
 
@@ -589,11 +603,11 @@ Panel {
                       width: parent.width
                       // A busy core must never read as an empty box, so keep a
                       // 1px pip once there is any load at all.
-                      height: Math.max(modelData > 0 ? 1 : 0,
-                                       parent.height * Model.clamp(modelData / 100, 0, 1))
+                      height: Math.max(core.load > 0 ? 1 : 0,
+                                       parent.height * Model.clamp(core.load / 100, 0, 1))
                       radius: parent.radius
                       color: Qt.tint(root.foreground,
-                                     Qt.rgba(root.urgent.r, root.urgent.g, root.urgent.b, Model.severity(modelData)))
+                                     Qt.rgba(root.urgent.r, root.urgent.g, root.urgent.b, Model.severity(core.load)))
                       opacity: 0.9
 
                       Behavior on height {
@@ -606,7 +620,7 @@ Panel {
                     visible: coreCluster.labelled
                     width: coreCluster.columnWidth
                     textFormat: Text.PlainText
-                    text: index
+                    text: core.index
                     color: root.dim
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.caption
@@ -738,15 +752,16 @@ Panel {
               bottomPadding: Style.space(6)
             }
 
+            // Fixed row count (the sampler sends the same five) so the rows
+            // persist across samples and their fill widths animate.
             Repeater {
-              model: root.processRows.slice(0, 5)
+              model: 5
 
               ProcessRow {
-                required property var modelData
                 required property int index
                 width: parent.width
-                row: modelData
-                rank: index
+                visible: !!row
+                row: root.processRows[index] || null
               }
             }
           }
@@ -804,14 +819,15 @@ Panel {
             spacing: Style.space(8)
 
             Repeater {
-              model: root.mounts
+              model: root.mounts.length
 
               Column {
-                required property var modelData
+                required property int index
+                readonly property var mount: root.mounts[index] || ({})
                 width: parent.width
                 spacing: Style.space(3)
 
-                readonly property real usedFraction: Model.fraction(modelData.used, modelData.total)
+                readonly property real usedFraction: Model.fraction(mount.used, mount.total)
 
                 Item {
                   width: parent.width
@@ -821,7 +837,7 @@ Panel {
                     id: mountPath
                     anchors.left: parent.left
                     textFormat: Text.PlainText
-                    text: String(modelData.path)
+                    text: String(mount.path || "")
                     color: root.foreground
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.bodySmall
@@ -830,7 +846,7 @@ Panel {
                   Text {
                     anchors.right: parent.right
                     textFormat: Text.PlainText
-                    text: Model.bytes(modelData.used) + " of " + Model.bytes(modelData.total)
+                    text: Model.bytes(mount.used) + " of " + Model.bytes(mount.total)
                       + "   " + Model.percent(parent.parent.usedFraction * 100)
                     color: root.dim
                     font.family: root.fontFamily
@@ -938,25 +954,27 @@ Panel {
             rowSpacing: Style.space(3)
 
             Repeater {
-              model: root.temps
+              model: root.temps.length
 
               SensorCell {
-                required property var modelData
+                required property int index
+                readonly property var reading: root.temps[index] || ({})
                 width: (parent.width - Style.space(14)) / 2
-                label: String(modelData.label)
-                value: Model.temperature(modelData.value)
-                severity: Model.tempSeverity(modelData.value)
+                label: String(reading.label || "")
+                value: Model.temperature(reading.value)
+                severity: Model.tempSeverity(reading.value)
               }
             }
 
             Repeater {
-              model: root.fans
+              model: root.fans.length
 
               SensorCell {
-                required property var modelData
+                required property int index
+                readonly property var reading: root.fans[index] || ({})
                 width: (parent.width - Style.space(14)) / 2
-                label: String(modelData.label)
-                value: Math.round(Model.num(modelData.value)) + " RPM"
+                label: String(reading.label || "")
+                value: Math.round(Model.num(reading.value)) + " RPM"
               }
             }
           }
@@ -1184,7 +1202,6 @@ Panel {
   // separate meter to every line.
   component ProcessRow: Item {
     property var row: null
-    property int rank: 0
 
     readonly property real metric: row ? (root.processSort === "mem" ? Model.num(row.mem) : Model.num(row.cpu)) : 0
     readonly property real topMetric: {
@@ -1285,7 +1302,7 @@ Panel {
         id: footerLabel
         anchors.verticalCenter: parent.verticalCenter
         textFormat: Text.PlainText
-        text: "Open btop"
+        text: "Open " + Model.monitorName(root.terminalCommand)
         color: root.foreground
         font.family: root.fontFamily
         font.pixelSize: Style.font.body

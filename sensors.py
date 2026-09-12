@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Streaming system telemetry for the homin.istat Omarchy bar widget.
+"""Streaming system telemetry for the Ostat Menus Omarchy bar widget.
 
 Prints one JSON object per line on stdout, one per sampling tick, and never
 exits on its own. Everything comes from /proc and /sys, so there are no
@@ -28,6 +28,8 @@ import time
 CLK_TCK = os.sysconf("SC_CLK_TCK")
 PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
 SECTOR_SIZE = 512
+# Rows per process table. Panel.qml renders exactly this many.
+TOP_PROCESSES = 5
 
 # Filesystems that represent real storage the user cares about. Everything
 # else in mountinfo is kernel bookkeeping (proc, sysfs, cgroup), a tmpfs that
@@ -296,6 +298,11 @@ def sensors(detail):
     cpu_temp = None
     gpu_temp = None
 
+    # Readings that can stand in for the package temperature when no chip
+    # labels one. Kept separately from `temps` so the fallback also works
+    # with detail off, when `temps` is not collected at all.
+    cpu_candidates = []
+
     for name, path in hwmon_chips():
         try:
             files = os.listdir(path)
@@ -318,6 +325,8 @@ def sensors(detail):
                     cpu_temp = value
                 if name in ("amdgpu", "nouveau", "nvidia", "i915", "xe") and gpu_temp is None:
                     gpu_temp = value
+                if name in ("coretemp", "k10temp", "zenpower", "acpitz"):
+                    cpu_candidates.append(value)
                 if detail:
                     temps.append({"chip": name, "label": label, "value": value})
 
@@ -330,10 +339,8 @@ def sensors(detail):
 
     # No labelled package sensor: fall back to the hottest core-ish reading so
     # the hero still has a temperature to show.
-    if cpu_temp is None:
-        candidates = [t["value"] for t in temps if t["chip"] in ("coretemp", "k10temp", "zenpower", "acpitz")]
-        if candidates:
-            cpu_temp = max(candidates)
+    if cpu_temp is None and cpu_candidates:
+        cpu_temp = max(cpu_candidates)
 
     return {"cpuTemp": cpu_temp, "gpuTemp": gpu_temp, "temps": temps[:12], "fans": fans[:6]}
 
@@ -445,9 +452,17 @@ def process_table(prev_times, elapsed, ncpu):
             "mem": rss,
         })
 
-    by_cpu = sorted(rows, key=lambda r: r["cpu"], reverse=True)[:6]
-    by_mem = sorted(rows, key=lambda r: r["mem"], reverse=True)[:6]
+    by_cpu = sorted(rows, key=lambda r: r["cpu"], reverse=True)[:TOP_PROCESSES]
+    by_mem = sorted(rows, key=lambda r: r["mem"], reverse=True)[:TOP_PROCESSES]
     return cur_times, by_cpu, by_mem
+
+
+def uptime_seconds():
+    parts = read_text("/proc/uptime").split()
+    try:
+        return float(parts[0])
+    except (IndexError, ValueError):
+        return 0.0
 
 
 # ---------------------------------------------------------------- main loop
@@ -572,7 +587,7 @@ def main():
             "kernel": static["kernel"],
             "cpuModel": static["cpuModel"],
             "cpuCount": ncpu,
-            "uptime": float(read_text("/proc/uptime").split()[0] or 0),
+            "uptime": uptime_seconds(),
             "load": [round(load1, 2), round(load5, 2), round(load15, 2)],
             "cpu": round(pct.get("cpu", 0.0), 1),
             "cores": cores,
@@ -605,6 +620,10 @@ def main():
             sys.stdout.flush()
         except OSError as exc:
             if exc.errno == errno.EPIPE:
+                # The reader went away. Point stdout at /dev/null before
+                # returning, or the interpreter's exit-time flush trips over
+                # the same broken pipe and prints a traceback nobody asked for.
+                os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
                 return 0
             raise
 
@@ -637,9 +656,15 @@ def main():
                 # interval before its first detailed sample. Seed the per-pid
                 # tick counts now and emit after a short delay, so the first
                 # process table already carries real percentages instead of a
-                # column of zeros.
+                # column of zeros. Every other counter is re-snapshotted with
+                # it: moving prev_time alone would divide up to a whole idle
+                # interval of network and disk bytes by 0.35 s, and that spike
+                # then owns the auto-scaled graphs for the next minute.
                 if state["detail"] and not prev_proc:
                     prev_proc, _, _ = process_table({}, 1.0, ncpu)
+                    prev_cpu = read_cpu_times()
+                    prev_net = net_counters()
+                    prev_disk = disk_counters()
                     prev_time = time.monotonic()
                 deadline = time.monotonic() + 0.35
             else:

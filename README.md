@@ -87,10 +87,22 @@ Set these on the widget's entry in `~/.config/omarchy/shell.json`, or with
 Non-string values need `--json`:
 
 ```bash
-omarchy bar set io.github.hominluo.ostat-menus items '["cpu","mem","gpu","net","disk"]' --json
 omarchy bar set io.github.hominluo.ostat-menus graph false --json
+omarchy bar set io.github.hominluo.ostat-menus interval 5 --json
 omarchy bar set io.github.hominluo.ostat-menus monitorCommand "alacritty -e htop"
 ```
+
+`items` has to be edited in `shell.json` by hand: Quickshell's IPC client
+(`qs ipc call`, as of 0.3.1) splits every argument on commas, so a JSON array
+never reaches the shell in one piece and `omarchy bar set … --json` fails with
+"Too many arguments provided". The entry looks like this:
+
+```json
+{ "id": "io.github.hominluo.ostat-menus", "items": ["cpu", "mem", "gpu", "net", "disk"] }
+```
+
+The shell picks the change up on save. Settings changed while the widget is
+running reach the sampler immediately; the graphs keep their history.
 
 ## How it samples
 
@@ -164,13 +176,16 @@ omarchy-shell shell rescanPlugins
 omarchy plugin enable io.github.hominluo.ostat-menus
 ```
 
-Saving a file under `~/.config/omarchy/plugins/` hot-reloads the plugin, so
-edits show up immediately. `omarchy plugin validate .` checks the manifest.
+`omarchy plugin validate .` checks the manifest. Saving a file under
+`~/.config/omarchy/plugins/` makes the shell reload the plugin's code, but the
+bar keeps the widget instance it already has — `Component.onCompleted` does
+not run again and the sampler is not restarted — so after editing `Panel.qml`
+run `omarchy restart shell` to see the change.
 
 | File | What it is |
 |---|---|
 | `manifest.json` | plugin declaration and the settings schema |
-| `sensors.py` | the sampler: `/proc` and `/sys` in, NDJSON out |
+| `sensors.py` | the sampler: `/proc` and `/sys` in, NDJSON out (`--once`, `--detail`, `--interval N`) |
 | `Panel.qml` | bar widget and popup panel |
 | `Sparkline.qml` | history graph — area fill, stroked line, fixed time base |
 | `MeterBar.qml` | single-value and segmented usage bars |

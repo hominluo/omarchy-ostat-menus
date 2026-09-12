@@ -1,7 +1,7 @@
 .pragma library
 
-// Formatting helpers for the iStat panel. Kept out of the QML so the panel
-// body stays layout, and so the unit rules live in exactly one place.
+// Formatting helpers for the Ostat Menus panel. Kept out of the QML so the
+// panel body stays layout, and so the unit rules live in exactly one place.
 
 var KIB = 1024
 
@@ -27,7 +27,9 @@ function bytes(value, unitSuffix) {
     n /= KIB
     index++
   }
-  var digits = index === 0 ? 0 : (n < 10 ? 2 : (n < 100 ? 1 : 0))
+  // Thresholds sit just under the round number so toFixed cannot round
+  // 9.996 up to "10.00" and grow the column by a character.
+  var digits = index === 0 ? 0 : (n < 9.995 ? 2 : (n < 99.95 ? 1 : 0))
   return n.toFixed(digits) + " " + units[index] + suffix
 }
 
@@ -36,17 +38,31 @@ function rate(value) {
 }
 
 // The bar has no room for "1.23 MB/s". One significant figure and a bare
-// unit letter keeps every rate three or four characters wide.
+// unit letter keeps every rate at most four characters wide. Units roll
+// over at 999.5 rather than 1024 so the text never reads "1000K"; the few
+// bytes between print as "1.0K", the same way 9.96 prints as "10K".
 function rateCompact(value) {
   var n = num(value)
-  if (n < 1000) return Math.round(n) + "B"
+  if (n < 999.5) return Math.round(n) + "B"
   var units = ["K", "M", "G", "T"]
-  var index = -1
-  while (n >= KIB && index < units.length - 1) {
+  var index = 0
+  n /= KIB
+  while (n >= 999.5 && index < units.length - 1) {
     n /= KIB
     index++
   }
-  return (n < 10 ? n.toFixed(1) : Math.round(n).toString()) + units[index]
+  return (n < 9.95 ? n.toFixed(1) : Math.round(n).toString()) + units[index]
+}
+
+// Footer label for the configured monitor command: the program it runs,
+// which is the last token that is not a flag. "omarchy-launch-or-focus-tui
+// btop" and "alacritty -e htop" both name the tool a reader will see open.
+function monitorName(command) {
+  var tokens = String(command || "").trim().split(/\s+/)
+  for (var i = tokens.length - 1; i >= 0; i--) {
+    if (tokens[i] !== "" && tokens[i].charAt(0) !== "-") return tokens[i].replace(/^.*\//, "")
+  }
+  return "monitor"
 }
 
 function percent(value, digits) {
