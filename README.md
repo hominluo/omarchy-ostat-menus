@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <img src="preview.png" alt="The Ostat Menus panel" width="420">
+  <img src="preview.png" alt="The bar readout with the Ostat Menus panel dropped down beneath it" width="400">
 </p>
 
 <p align="center">
