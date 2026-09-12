@@ -240,7 +240,8 @@ Panel {
               text: root.cellGlyph(String(modelData))
               color: root.barForeground
               font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
+              font.pixelSize: Style.bar.iconFont
+              renderType: Text.NativeRendering
             }
 
             Text {
@@ -310,14 +311,17 @@ Panel {
     spacing: Style.space(4)
     visible: kind !== "gpu" || !!root.gpuInfo
 
+    // Same size and weight as the stock bar icons (BarIconButton uses
+    // Style.bar.iconFont at full opacity), so the readout reads as part of
+    // the bar rather than a dimmed annex of it.
     Text {
       anchors.verticalCenter: parent.verticalCenter
       textFormat: Text.PlainText
       text: root.cellGlyph(cell.kind)
       color: root.barForeground
-      opacity: 0.62
       font.family: root.fontFamily
-      font.pixelSize: Style.font.bodySmall
+      font.pixelSize: Style.bar.iconFont
+      renderType: Text.NativeRendering
     }
 
     Sparkline {
