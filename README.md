@@ -3,6 +3,8 @@
 <p align="center">
   A system monitor for the <a href="https://omarchy.org">Omarchy</a> bar —
   live readout up top, the whole machine one click away.
+<br>
+  <sub>by <a href="https://x.com/hominluo">@hominluo</a></sub>
 </p>
 
 <p align="center">
@@ -200,5 +202,8 @@ Not affiliated with Bjango or iStat Menus; the name is a nod, the code is not.
 ---
 
 <p align="center">
-  Built by <a href="https://x.com/hominluo">@hominluo</a>
+  Built by <a href="https://x.com/hominluo">@hominluo</a> ·
+  <a href="https://github.com/hominluo">GitHub</a> ·
+  <a href="https://github.com/hominluo/omarchy-ostat-menus/issues">Issues</a> ·
+  <a href="https://github.com/hominluo/omarchy-ostat-menus/releases">Releases</a>
 </p>
