@@ -347,52 +347,400 @@ def sensors(detail):
 
 # ---------------------------------------------------------------- gpu
 
-def gpu_card():
-    """First DRM card that exposes a utilisation counter (amdgpu today)."""
-    base = "/sys/class/drm"
+# A machine can hold more than one GPU, and on a laptop the interesting pair
+# is usually a discrete card next to the integrated one that drives the
+# display. Each vendor publishes its utilisation somewhere different:
+#
+#   amdgpu   gpu_busy_percent, straight out of sysfs
+#   i915/xe  no busy counter at all; RC6 residency says how long the GPU sat
+#            in its sleep state, and the rest of the tick is work
+#   nvidia   nothing in sysfs under the proprietary driver; NVML is the only
+#            source, reached through ctypes so there is still no subprocess
+#
+# Each probe object holds whatever state its counter needs between ticks and
+# returns one reading per sample, or None when the device stops answering.
+
+PCI_IDS_PATHS = ("/usr/share/hwdata/pci.ids", "/usr/share/misc/pci.ids")
+
+# Drivers whose cards are an integrated GPU. Everything else sorts ahead of
+# them, so gpus[0] is the discrete card on a hybrid-graphics laptop.
+INTEGRATED_DRIVERS = ("i915", "xe")
+
+
+def drm_cards(base="/sys/class/drm"):
+    """Every real DRM device, without the connectors that share the prefix."""
     try:
         entries = sorted(os.listdir(base))
     except OSError:
-        return None
+        return []
+    cards = []
     for entry in entries:
         # card1-DP-1 and friends are connectors, not the device itself.
         if not entry.startswith("card") or "-" in entry:
             continue
-        device = f"{base}/{entry}/device"
-        if os.path.exists(f"{device}/gpu_busy_percent"):
-            return device
-    return None
+        cards.append((entry, f"{base}/{entry}/device"))
+    return cards
 
 
-def gpu(device):
-    if not device:
-        return None
-    busy = read_int(f"{device}/gpu_busy_percent")
-    if busy is None:
-        return None
-    vram_total = read_int(f"{device}/mem_info_vram_total", 0) or 0
-    vram_used = read_int(f"{device}/mem_info_vram_used", 0) or 0
-    power = None
-    hwmon_dir = f"{device}/hwmon"
-    name = "GPU"
+def driver_name(device):
     try:
-        for entry in os.listdir(hwmon_dir):
-            chip = f"{hwmon_dir}/{entry}"
-            name = read_text(f"{chip}/name").strip() or name
-            micro_watts = read_int(f"{chip}/power1_average") or read_int(f"{chip}/power1_input")
-            if micro_watts is not None:
-                power = round(micro_watts / 1_000_000.0, 1)
-            break
+        return os.path.basename(os.readlink(f"{device}/driver"))
     except OSError:
-        pass
+        return ""
+
+
+def pci_device_name(vendor, device, path=None):
+    """Marketing name for a PCI id, from the hwdata database if it is present.
+
+    The kernel never spells out "UHD Graphics 630" for an i915 card, and a
+    panel row reading "Intel 8086:3e9b" helps nobody. The file is a couple of
+    megabytes, so the scan stops at the end of the vendor's block rather than
+    reading the rest.
+    """
+    candidates = (path,) if path else PCI_IDS_PATHS
+    vendor = vendor.lower()
+    device = device.lower()
+    for candidate in candidates:
+        try:
+            with open(candidate, "r", errors="replace") as handle:
+                in_vendor = False
+                for line in handle:
+                    if not line.strip() or line.startswith("#"):
+                        continue
+                    if not line.startswith("\t"):
+                        # A vendor row. Reaching the next one means the
+                        # device is not listed under ours.
+                        if in_vendor:
+                            return ""
+                        in_vendor = line.split()[0].lower() == vendor
+                        continue
+                    if not in_vendor:
+                        continue
+                    # One tab is a device; two is a subsystem, which is a
+                    # different id space and must not match.
+                    if line.startswith("\t\t"):
+                        continue
+                    fields = line.strip().split(None, 1)
+                    if len(fields) == 2 and fields[0].lower() == device:
+                        return fields[1].strip()
+        except OSError:
+            continue
+    return ""
+
+
+def pci_name(device, fallback):
+    vendor = read_text(f"{device}/vendor").strip().replace("0x", "")
+    ident = read_text(f"{device}/device").strip().replace("0x", "")
+    if vendor and ident:
+        name = pci_device_name(vendor, ident)
+        if name:
+            return name
+    return fallback
+
+
+def reading(name, vendor, busy, integrated,
+            vram_used=0, vram_total=0, power=None, temp=None,
+            freq=None, freq_max=None):
+    """The one shape every probe returns, so the panel can render them alike."""
     return {
         "name": name,
-        "busy": busy,
-        "vramUsed": vram_used,
-        "vramTotal": vram_total,
+        "vendor": vendor,
+        "busy": round(float(busy), 1),
+        "vramUsed": int(vram_used),
+        "vramTotal": int(vram_total),
         "power": power,
+        "temp": temp,
+        "freq": freq,
+        "freqMax": freq_max,
+        "integrated": bool(integrated),
     }
 
+
+class AmdGpu(object):
+    """An amdgpu card, which publishes everything we need in sysfs."""
+
+    vendor = "amd"
+    integrated = False
+
+    def __init__(self, device, name):
+        self.device = device
+        self.name = name
+
+    @staticmethod
+    def counter_path(device):
+        path = f"{device}/gpu_busy_percent"
+        return path if os.path.exists(path) else None
+
+    def sample(self, elapsed):
+        busy = read_int(f"{self.device}/gpu_busy_percent")
+        if busy is None:
+            return None
+        power = None
+        temp = None
+        hwmon_dir = f"{self.device}/hwmon"
+        try:
+            for entry in sorted(os.listdir(hwmon_dir)):
+                chip = f"{hwmon_dir}/{entry}"
+                micro_watts = read_int(f"{chip}/power1_average") or read_int(f"{chip}/power1_input")
+                if micro_watts is not None:
+                    power = round(micro_watts / 1_000_000.0, 1)
+                milli = read_int(f"{chip}/temp1_input")
+                if milli is not None:
+                    temp = round(milli / 1000.0, 1)
+                break
+        except OSError:
+            pass
+        return reading(
+            self.name, self.vendor, busy, self.integrated,
+            vram_used=read_int(f"{self.device}/mem_info_vram_used", 0) or 0,
+            vram_total=read_int(f"{self.device}/mem_info_vram_total", 0) or 0,
+            power=power,
+            temp=temp,
+            freq=(read_int(f"{self.device}/pp_dpm_sclk") or None),
+        )
+
+
+class IntelGpu(object):
+    """An i915 or xe card, measured through RC6 residency.
+
+    The render engine parks in RC6 whenever it has nothing to do, and the
+    kernel counts the milliseconds it spends there. Time not spent asleep is
+    time spent working, so the share of the tick outside RC6 is the same
+    number `intel_gpu_top` and `btop` report as utilisation, without needing
+    the perf permissions the i915 PMU asks for.
+    """
+
+    vendor = "intel"
+    integrated = True
+
+    def __init__(self, device, card, name):
+        self.device = device
+        self.name = name
+        self.residency = self.residency_path(device, card)
+        self.freq_paths = self.frequency_paths(device, card)
+        self.previous = read_int(self.residency) if self.residency else None
+
+    @staticmethod
+    def residency_path(device, card):
+        candidates = (
+            # Modern kernels expose one directory per graphics tile.
+            f"{device}/drm/{card}/gt/gt0/rc6_residency_ms",
+            f"{device}/drm/{card}/power/rc6_residency_ms",
+        )
+        for path in candidates:
+            if os.path.exists(path):
+                return path
+        return None
+
+    @staticmethod
+    def frequency_paths(device, card):
+        tile = f"{device}/drm/{card}/gt/gt0"
+        if os.path.exists(f"{tile}/rps_act_freq_mhz"):
+            return (f"{tile}/rps_act_freq_mhz", f"{tile}/rps_RP0_freq_mhz")
+        legacy = os.path.dirname(os.path.dirname(device))
+        return (f"{legacy}/{card}/gt_act_freq_mhz", f"{legacy}/{card}/gt_RP0_freq_mhz")
+
+    def sample(self, elapsed):
+        if not self.residency:
+            return None
+        current = read_int(self.residency)
+        if current is None:
+            return None
+        previous = self.previous
+        self.previous = current
+        if previous is None:
+            return None
+        asleep_ms = current - previous
+        if asleep_ms < 0:
+            # The counter restarted, most likely across a suspend. One tick of
+            # nonsense is worse than one tick of nothing.
+            return None
+        window_ms = max(1.0, elapsed * 1000.0)
+        busy = 100.0 * (1.0 - asleep_ms / window_ms)
+        # Residency is sampled a moment after the clock, so a fully idle GPU
+        # can report a hair more sleep than the tick was long.
+        busy = max(0.0, min(100.0, busy))
+        return reading(
+            self.name, self.vendor, busy, self.integrated,
+            freq=read_int(self.freq_paths[0]),
+            freq_max=read_int(self.freq_paths[1]),
+        )
+
+
+class Nvml(object):
+    """The NVIDIA management library, bound directly with ctypes.
+
+    The proprietary driver puts no utilisation counter in sysfs and registers
+    no hwmon chip, so NVML is the only way to read one. Loading the library
+    keeps the widget's promise of a single process: this is a function call,
+    not a fork of `nvidia-smi` every tick.
+    """
+
+    TEMPERATURE_GPU = 0
+    CLOCK_GRAPHICS = 0
+
+    def __init__(self, library):
+        self.library = library
+        self.handles = []
+
+    @classmethod
+    def load(cls):
+        try:
+            import ctypes
+        except ImportError:
+            return None
+        for soname in ("libnvidia-ml.so.1", "libnvidia-ml.so"):
+            try:
+                library = ctypes.CDLL(soname)
+            except OSError:
+                continue
+            if library.nvmlInit_v2() != 0:
+                continue
+            instance = cls(library)
+            if instance.open_devices():
+                return instance
+            instance.shutdown()
+        return None
+
+    def open_devices(self):
+        import ctypes
+        count = ctypes.c_uint()
+        if self.library.nvmlDeviceGetCount_v2(ctypes.byref(count)) != 0:
+            return False
+        for index in range(count.value):
+            handle = ctypes.c_void_p()
+            if self.library.nvmlDeviceGetHandleByIndex_v2(index, ctypes.byref(handle)) == 0:
+                self.handles.append(handle)
+        return bool(self.handles)
+
+    def device_count(self):
+        return len(self.handles)
+
+    def sample(self, index):
+        import ctypes
+
+        class Utilisation(ctypes.Structure):
+            _fields_ = [("gpu", ctypes.c_uint), ("memory", ctypes.c_uint)]
+
+        class Memory(ctypes.Structure):
+            _fields_ = [("total", ctypes.c_ulonglong),
+                        ("free", ctypes.c_ulonglong),
+                        ("used", ctypes.c_ulonglong)]
+
+        handle = self.handles[index]
+        used = Utilisation()
+        if self.library.nvmlDeviceGetUtilizationRates(handle, ctypes.byref(used)) != 0:
+            return None
+
+        name = ctypes.create_string_buffer(96)
+        if self.library.nvmlDeviceGetName(handle, name, ctypes.c_uint(96)) == 0:
+            label = name.value.decode("utf-8", "replace").strip() or "NVIDIA GPU"
+        else:
+            label = "NVIDIA GPU"
+
+        memory = Memory()
+        vram_used = vram_total = 0
+        if self.library.nvmlDeviceGetMemoryInfo(handle, ctypes.byref(memory)) == 0:
+            vram_used = memory.used
+            vram_total = memory.total
+
+        celsius = ctypes.c_uint()
+        temp = None
+        if self.library.nvmlDeviceGetTemperature(
+                handle, self.TEMPERATURE_GPU, ctypes.byref(celsius)) == 0:
+            temp = float(celsius.value)
+
+        milli_watts = ctypes.c_uint()
+        power = None
+        if self.library.nvmlDeviceGetPowerUsage(handle, ctypes.byref(milli_watts)) == 0:
+            power = round(milli_watts.value / 1000.0, 1)
+
+        megahertz = ctypes.c_uint()
+        freq = None
+        if self.library.nvmlDeviceGetClockInfo(
+                handle, self.CLOCK_GRAPHICS, ctypes.byref(megahertz)) == 0:
+            freq = megahertz.value
+
+        return {
+            "name": label,
+            "busy": used.gpu,
+            "vramUsed": vram_used,
+            "vramTotal": vram_total,
+            "power": power,
+            "temp": temp,
+            "freq": freq,
+            "freqMax": None,
+        }
+
+    def shutdown(self):
+        try:
+            self.library.nvmlShutdown()
+        except Exception:
+            pass
+
+
+class NvidiaGpu(object):
+    vendor = "nvidia"
+    integrated = False
+
+    def __init__(self, nvml, index):
+        self.nvml = nvml
+        self.index = index
+
+    def sample(self, elapsed):
+        try:
+            values = self.nvml.sample(self.index)
+        except Exception:
+            return None
+        if not values:
+            return None
+        return reading(
+            values["name"], self.vendor, values["busy"], self.integrated,
+            vram_used=values["vramUsed"], vram_total=values["vramTotal"],
+            power=values["power"], temp=values["temp"],
+            freq=values["freq"], freq_max=values["freqMax"],
+        )
+
+
+def discover_gpus(base="/sys/class/drm", nvml=None):
+    """Every GPU this machine can report on, discrete cards first."""
+    discrete = []
+    integrated = []
+
+    if nvml is not None:
+        for index in range(nvml.device_count()):
+            discrete.append(NvidiaGpu(nvml, index))
+
+    for card, device in drm_cards(base):
+        driver = driver_name(device)
+        # NVML already covers these, and nouveau publishes no counter at all.
+        if driver in ("nvidia", "nouveau"):
+            continue
+        if driver in INTEGRATED_DRIVERS or (not driver and IntelGpu.residency_path(device, card)):
+            if IntelGpu.residency_path(device, card):
+                integrated.append(IntelGpu(device, card, pci_name(device, "Integrated Graphics")))
+            continue
+        if AmdGpu.counter_path(device):
+            discrete.append(AmdGpu(device, pci_name(device, "GPU")))
+
+    return discrete + integrated
+
+
+def sample_gpus(probes, elapsed):
+    readings = []
+    for probe in probes:
+        try:
+            value = probe.sample(elapsed)
+        except Exception:
+            value = None
+        if value is not None:
+            readings.append(value)
+    return readings
+
+
+def primary_gpu(readings):
+    """The card the bar cell and the legacy `gpu` field refer to."""
+    return readings[0] if readings else None
 
 # ---------------------------------------------------------------- processes
 
@@ -524,7 +872,9 @@ def main():
     state = {"interval": interval, "detail": detail_default or once, "stdinOpen": True, "wake": False, "buffer": b""}
     static = host_info()
     ncpu = static["cpuCount"]
-    gpu_device = gpu_card()
+    # NVML is opened once and kept for the life of the process; the NVIDIA
+    # probes below hold handles into it.
+    gpu_probes = discover_gpus(nvml=Nvml.load())
 
     prev_cpu = read_cpu_times()
     prev_net = net_counters()
@@ -575,6 +925,8 @@ def main():
         write_rate = max(0.0, (cur_disk[1] - prev_disk[1]) / elapsed)
         prev_disk = cur_disk
 
+        gpu_readings = sample_gpus(gpu_probes, elapsed)
+
         try:
             load1, load5, load15 = os.getloadavg()
         except OSError:
@@ -601,9 +953,21 @@ def main():
                 "txTotal": tx_total,
             },
             "disk": {"read": round(read_rate), "write": round(write_rate)},
-            "gpu": gpu(gpu_device),
+            "gpus": gpu_readings,
+            # Kept so a panel built against the single-GPU payload keeps
+            # rendering: it is simply the first card.
+            "gpu": primary_gpu(gpu_readings),
         }
         payload.update(sensors(detail))
+
+        # The proprietary NVIDIA driver registers no hwmon chip, so the
+        # sensor sweep finds no GPU temperature on those machines. The card
+        # reports its own, so fall back to that rather than showing none.
+        if payload.get("gpuTemp") is None:
+            for value in gpu_readings:
+                if value["temp"] is not None:
+                    payload["gpuTemp"] = value["temp"]
+                    break
 
         if detail:
             prev_proc, by_cpu, by_mem = process_table(prev_proc, elapsed, ncpu)

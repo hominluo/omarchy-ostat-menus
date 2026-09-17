@@ -113,6 +113,19 @@ function shortCpuModel(model) {
   return text
 }
 
+// The PCI database writes a chip's codename first and its marketing name in
+// brackets: "TU117GLM [Quadro T1000 Mobile]", "CoffeeLake-H GT2 [UHD Graphics
+// 630]". The bracketed half is the one people recognise, so it wins the
+// section header; a name with no brackets is already the short form.
+function shortGpuModel(name) {
+  var text = String(name || "").trim()
+  var bracketed = text.match(/\[([^\]]+)\]/)
+  if (bracketed) text = bracketed[1]
+  text = text.replace(/\((R|TM|r|tm)\)/g, "")
+  text = text.replace(/^(NVIDIA|AMD|ATI|Intel)\s+(Corporation\s+)?/i, "")
+  return text.replace(/\s+/g, " ").trim()
+}
+
 // A kernel comm is capped at 15 characters, so long binaries arrive already
 // truncated; this only has to catch the kernel-thread noise and keep the
 // column from stretching.

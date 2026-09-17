@@ -26,8 +26,8 @@
 ---
 
 CPU history and per-core load, memory composition, the top of the process
-table, network and disk throughput, GPU utilisation, and every temperature the
-machine reports — in one panel that follows your Omarchy theme.
+table, network and disk throughput, every GPU's utilisation, and every
+temperature the machine reports — in one panel that follows your Omarchy theme.
 
 Everything comes from `/proc` and `/sys`. No `psutil`, no `lm_sensors`, no
 network, and no subprocess per sample: one small Python process streams the
@@ -51,10 +51,14 @@ omarchy plugin remove io.github.hominluo.ostat-menus
 
 ## The bar
 
-Each configured metric gets a cell. Percentages (`cpu`, `mem`, `gpu`) render as
-an icon, an optional micro-sparkline and a number; throughput (`net`, `disk`)
-renders as a two-line down/up stack, which is the only way both directions fit
-in a 26px bar.
+Each configured metric gets a cell. Percentages (`cpu`, `mem`, `gpu`, `gpu2`)
+render as an icon, an optional micro-sparkline and a number; throughput
+(`net`, `disk`) renders as a two-line down/up stack, which is the only way both
+directions fit in a 26px bar.
+
+`gpu` is the first card and `gpu2` the second, which on a hybrid-graphics
+laptop means the discrete GPU and then the integrated one. A cell for a card
+the machine does not have takes up no room.
 
 | Interaction | Result |
 |---|---|
@@ -79,7 +83,7 @@ Set these on the widget's entry in `~/.config/omarchy/shell.json`, or with
 
 | Key | Default | What it does |
 |---|---|---|
-| `items` | `["cpu","mem","net"]` | which metrics the bar shows, in order: `cpu`, `mem`, `net`, `disk`, `gpu`, `temp` |
+| `items` | `["cpu","mem","net"]` | which metrics the bar shows, in order: `cpu`, `mem`, `net`, `disk`, `gpu`, `gpu2`, `temp` |
 | `graph` | `true` | draw the micro-sparklines in the bar |
 | `interval` | `2` | seconds between samples while the panel is closed |
 | `activeInterval` | `1` | seconds between samples while the panel is open |
@@ -141,10 +145,25 @@ Two implementation notes worth knowing if you fork this:
 - **CPU, memory, swap, load, network, disk I/O, filesystem usage** — everywhere.
 - **Temperatures and fans** — whatever `hwmon` exposes. A machine with no sensor
   drivers loaded simply has no SENSORS section.
-- **GPU** — utilisation, VRAM, temperature and power come from the amdgpu sysfs
-  interface. Intel and NVIDIA expose no equivalent `gpu_busy_percent`, so on
-  those machines the GRAPHICS section hides itself and only the GPU temperature,
-  if any, shows up under SENSORS.
+- **GPU** — every card the machine has, discrete first. Each vendor keeps its
+  utilisation somewhere different:
+
+  | Vendor | Source | What you get |
+  |---|---|---|
+  | AMD | `gpu_busy_percent` in sysfs | utilisation, VRAM, temperature, power |
+  | NVIDIA | NVML, called through `ctypes` | utilisation, VRAM, temperature, power, clock |
+  | Intel | RC6 residency in sysfs | utilisation, clock |
+
+  The proprietary NVIDIA driver publishes no utilisation counter in sysfs and
+  registers no `hwmon` chip, so NVML is the only source; it is loaded as a
+  shared library, which keeps the promise of one process and no forks. A
+  machine without the driver installed simply has no NVIDIA section.
+
+  Intel's render engine parks in RC6 whenever it is idle and the kernel counts
+  the milliseconds it spends there, so the share of each tick spent outside
+  RC6 is the utilisation figure. It matches what `btop` reports. An integrated
+  GPU has no VRAM of its own, and neither a temperature nor a power reading, so
+  those rows give way to its clock.
 
 A few numbers are computed rather than copied, and the definitions matter:
 
@@ -167,7 +186,9 @@ A few numbers are computed rather than copied, and the definitions matter:
   error, but it is why the sampler is careful about what it does per tick.
 - Plugins run unsandboxed inside `omarchy-shell`. This one reads `/proc` and
   `/sys`, opens no sockets, and spawns no processes other than the command
-  behind the footer button. It is a few hundred lines — read them.
+  behind the footer button. It is a few hundred lines — read them. On a machine
+  with the NVIDIA driver installed it also loads `libnvidia-ml.so`, the same
+  library `nvidia-smi` uses, and calls it in-process.
 
 ## Development
 
@@ -178,6 +199,8 @@ omarchy-shell shell rescanPlugins
 omarchy plugin enable io.github.hominluo.ostat-menus
 ```
 
+`python3 tests/test_gpu.py` runs the GPU suite; it builds its own `/sys`
+trees in a temp directory, so it passes on a machine with no GPU at all.
 `omarchy plugin validate .` checks the manifest. Saving a file under
 `~/.config/omarchy/plugins/` makes the shell reload the plugin's code, but the
 bar keeps the widget instance it already has — `Component.onCompleted` does
@@ -192,6 +215,7 @@ run `omarchy restart shell` to see the change.
 | `Sparkline.qml` | history graph — area fill, stroked line, fixed time base |
 | `MeterBar.qml` | single-value and segmented usage bars |
 | `Model.js` | unit formatting and threshold helpers |
+| `tests/test_gpu.py` | GPU discovery and sampling, against synthetic `/sys` trees |
 
 ## License
 

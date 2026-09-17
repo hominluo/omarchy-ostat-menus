@@ -43,7 +43,10 @@ Panel {
   property var memHistory: []
   property var rxHistory: []
   property var txHistory: []
-  property var gpuHistory: []
+  // One ring per GPU, in payload order. gpuHistory stays as the first
+  // card's ring so the bar cell keeps its existing binding.
+  property var gpuHistories: []
+  readonly property var gpuHistory: gpuHistories.length > 0 ? gpuHistories[0] : []
 
   readonly property color foreground: bar ? bar.foreground : Color.foreground
   readonly property color urgent: bar ? bar.urgent : Color.urgent
@@ -60,7 +63,8 @@ Panel {
   readonly property real reclaimable: Math.max(0, Model.num(memInfo.available) - Model.num(memInfo.free))
   readonly property var netInfo: sample.net || {}
   readonly property var diskInfo: sample.disk || {}
-  readonly property var gpuInfo: sample.gpu || null
+  readonly property var gpuList: sample.gpus || (sample.gpu ? [sample.gpu] : [])
+  readonly property var gpuInfo: gpuList.length > 0 ? gpuList[0] : null
   readonly property var cores: sample.cores || []
   readonly property var mounts: sample.mounts || []
   readonly property var temps: sample.temps || []
@@ -106,7 +110,17 @@ Panel {
                                                              payload.mem ? payload.mem.total : 0) * 100, historySize)
     rxHistory = Model.pushSample(rxHistory, payload.net ? payload.net.rx : 0, historySize)
     txHistory = Model.pushSample(txHistory, payload.net ? payload.net.tx : 0, historySize)
-    if (payload.gpu) gpuHistory = Model.pushSample(gpuHistory, payload.gpu.busy, historySize)
+    var cards = payload.gpus || (payload.gpu ? [payload.gpu] : [])
+    if (cards.length > 0) {
+      var rings = gpuHistories.slice()
+      // A card can appear or disappear across a suspend, so the rings are
+      // grown and trimmed to whatever this tick reported.
+      while (rings.length < cards.length) rings.push([])
+      rings.length = cards.length
+      for (var i = 0; i < cards.length; i++)
+        rings[i] = Model.pushSample(rings[i], cards[i].busy, historySize)
+      gpuHistories = rings
+    }
   }
 
   // Started from Component.onCompleted rather than `running: true` here:
@@ -260,6 +274,20 @@ Panel {
     }
   }
 
+  // Bar cells name a GPU by position: "gpu" is the first card the sampler
+  // reported, "gpu2" the second. On a hybrid laptop that is the discrete
+  // card and then the integrated one.
+  function gpuAt(kind) {
+    if (kind === "gpu") return gpuList.length > 0 ? gpuList[0] : null
+    if (kind === "gpu2") return gpuList.length > 1 ? gpuList[1] : null
+    return null
+  }
+
+  function gpuRing(kind) {
+    var index = kind === "gpu" ? 0 : (kind === "gpu2" ? 1 : -1)
+    return index >= 0 && gpuHistories.length > index ? gpuHistories[index] : []
+  }
+
   function cellGlyph(kind) {
     switch (kind) {
       case "cpu": return "󰻠"
@@ -267,6 +295,7 @@ Panel {
       case "net": return "󰓅"
       case "disk": return "󰋊"
       case "gpu": return "󰢮"
+      case "gpu2": return "󰢮"
       case "temp": return "󰔏"
       default: return "󰇅"
     }
@@ -280,7 +309,11 @@ Panel {
       case "mem": return Math.round(memValue) + ""
       case "net": return Model.rateCompact(Model.num(netInfo.rx) + Model.num(netInfo.tx))
       case "disk": return Model.rateCompact(Model.num(diskInfo.read) + Model.num(diskInfo.write))
-      case "gpu": return gpuInfo ? Math.round(Model.num(gpuInfo.busy)) + "" : "–"
+      case "gpu":
+      case "gpu2": {
+        var card = gpuAt(kind)
+        return card ? Math.round(Model.num(card.busy)) + "" : "–"
+      }
       case "temp": return cpuTemp >= 0 ? Math.round(cpuTemp) + "" : "–"
       default: return ""
     }
@@ -298,7 +331,10 @@ Panel {
     readonly property real percentValue: {
       if (kind === "cpu") return root.cpuValue
       if (kind === "mem") return root.memValue
-      if (kind === "gpu") return root.gpuInfo ? Model.num(root.gpuInfo.busy) : 0
+      if (kind === "gpu" || kind === "gpu2") {
+        var card = root.gpuAt(kind)
+        return card ? Model.num(card.busy) : 0
+      }
       return 0
     }
     // The single-line figure. Temperature is the one non-rate metric that is
@@ -311,14 +347,15 @@ Panel {
     readonly property var graphValues: {
       if (kind === "cpu") return root.cpuHistory
       if (kind === "mem") return root.memHistory
-      if (kind === "gpu") return root.gpuHistory
+      if (kind === "gpu" || kind === "gpu2") return root.gpuRing(kind)
       return []
     }
     readonly property bool graphable: root.showGraph && graphValues.length >= 5
 
     anchors.verticalCenter: parent.verticalCenter
     spacing: Style.space(4)
-    visible: kind !== "gpu" || !!root.gpuInfo
+    // A GPU cell for a card this machine does not have takes no room.
+    visible: (kind !== "gpu" && kind !== "gpu2") || !!root.gpuAt(kind)
 
     // Same size and weight as the stock bar icons (BarIconButton uses
     // Style.bar.iconFont at full opacity), so the readout reads as part of
@@ -868,64 +905,91 @@ Panel {
 
           // ---------------------------------------------------------- gpu
 
-          PanelSeparator {
-            foreground: root.foreground
-            visible: !!root.gpuInfo
-          }
+          // One block per card. A hybrid laptop reports the discrete GPU and
+          // the integrated one, and they carry different facts: the discrete
+          // card knows its VRAM, temperature and wattage, while the
+          // integrated one shares system memory and only knows its clock.
+          Repeater {
+            model: root.gpuList
 
-          SectionRow {
-            visible: !!root.gpuInfo
-            label: "GRAPHICS"
-            value: root.gpuInfo ? String(root.gpuInfo.name) : ""
-          }
+            Column {
+              required property var modelData
+              required property int index
 
-          Column {
-            width: parent.width
-            visible: !!root.gpuInfo
-            spacing: Style.space(6)
-
-            InfoLine {
-              label: "Utilisation"
-              value: root.gpuInfo ? Model.percent(root.gpuInfo.busy) : ""
-            }
-
-            MeterBar {
               width: parent.width
-              height: Style.space(5)
-              foreground: root.foreground
-              warnColor: root.urgent
-              value: root.gpuInfo ? Model.clamp(Model.num(root.gpuInfo.busy) / 100, 0, 1) : 0
-              severity: root.gpuInfo ? Model.severity(root.gpuInfo.busy) : 0
-            }
+              spacing: Style.space(12)
 
-            InfoLine {
-              visible: !!root.gpuInfo && Model.num(root.gpuInfo.vramTotal) > 0
-              label: "VRAM"
-              value: root.gpuInfo
-                ? Model.bytes(root.gpuInfo.vramUsed) + " of " + Model.bytes(root.gpuInfo.vramTotal)
-                : ""
-            }
+              readonly property var card: modelData
+              readonly property bool hasVram: Model.num(card.vramTotal) > 0
+              readonly property real vramFraction: Model.fraction(card.vramUsed, card.vramTotal)
 
-            MeterBar {
-              width: parent.width
-              height: Style.space(5)
-              visible: !!root.gpuInfo && Model.num(root.gpuInfo.vramTotal) > 0
-              foreground: root.foreground
-              warnColor: root.urgent
-              value: root.gpuInfo ? Model.fraction(root.gpuInfo.vramUsed, root.gpuInfo.vramTotal) : 0
-              severity: root.gpuInfo ? Model.severity(Model.fraction(root.gpuInfo.vramUsed, root.gpuInfo.vramTotal) * 100) : 0
-            }
+              PanelSeparator { foreground: root.foreground }
 
-            InfoLine {
-              label: "Temperature"
-              value: {
-                if (!root.gpuInfo) return ""
-                var parts = []
-                if (root.sample.gpuTemp !== null && root.sample.gpuTemp !== undefined)
-                  parts.push(Model.temperature(root.sample.gpuTemp))
-                if (root.gpuInfo.power !== null && root.gpuInfo.power !== undefined)
-                  parts.push(Number(root.gpuInfo.power).toFixed(1) + " W")
-                return parts.join("   ")
+              SectionRow {
+                // "GRAPHICS" alone on a one-GPU machine, numbered once there
+                // is more than one card to tell apart.
+                label: root.gpuList.length > 1 ? "GRAPHICS " + (index + 1) : "GRAPHICS"
+                value: Model.shortGpuModel(card.name)
+              }
+
+              Column {
+                width: parent.width
+                spacing: Style.space(6)
+
+                InfoLine {
+                  label: "Utilisation"
+                  value: Model.percent(card.busy)
+                }
+
+                MeterBar {
+                  width: parent.width
+                  height: Style.space(5)
+                  foreground: root.foreground
+                  warnColor: root.urgent
+                  value: Model.clamp(Model.num(card.busy) / 100, 0, 1)
+                  severity: Model.severity(card.busy)
+                }
+
+                InfoLine {
+                  visible: hasVram
+                  label: "VRAM"
+                  value: Model.bytes(card.vramUsed) + " of " + Model.bytes(card.vramTotal)
+                }
+
+                MeterBar {
+                  width: parent.width
+                  height: Style.space(5)
+                  visible: hasVram
+                  foreground: root.foreground
+                  warnColor: root.urgent
+                  value: vramFraction
+                  severity: Model.severity(vramFraction * 100)
+                }
+
+                // The integrated GPU has no VRAM of its own and publishes
+                // neither a temperature nor a power reading, so its clock is
+                // the only other thing there is to say about it.
+                InfoLine {
+                  label: "Clock"
+                  value: {
+                    var current = Model.frequency(card.freq)
+                    if (current === "") return ""
+                    var ceiling = Model.frequency(card.freqMax)
+                    return ceiling === "" ? current : current + " of " + ceiling
+                  }
+                }
+
+                InfoLine {
+                  label: "Temperature"
+                  value: {
+                    var parts = []
+                    if (card.temp !== null && card.temp !== undefined)
+                      parts.push(Model.temperature(card.temp))
+                    if (card.power !== null && card.power !== undefined)
+                      parts.push(Number(card.power).toFixed(1) + " W")
+                    return parts.join("   ")
+                  }
+                }
               }
             }
           }

@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "io.github.hominluo.ostat-menus",
   "name": "Ostat Menus",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "author": "Homin Luo",
   "license": "MIT",
-  "description": "Live CPU, memory, network, disk, GPU and temperature readout in the bar, with a full system-monitor panel.",
+  "description": "Live CPU, memory, network, disk, GPU and temperature readout in the bar, with a full system-monitor panel. Reads AMD, NVIDIA and Intel GPUs.",
   "kinds": [
     "bar-widget"
   ],
@@ -14,7 +14,7 @@
   },
   "barWidget": {
     "displayName": "Ostat Menus",
-    "description": "System resource monitor: bar readout plus a panel with CPU history, per-core load, memory composition, top processes, network and disk throughput, GPU and sensors.",
+    "description": "System resource monitor: bar readout plus a panel with CPU history, per-core load, memory composition, top processes, network and disk throughput, every GPU and sensors.",
     "category": "System",
     "allowMultiple": false,
     "defaultSection": "right",
@@ -35,7 +35,7 @@
         "key": "items",
         "type": "array",
         "label": "Bar readouts",
-        "description": "Which metrics appear in the bar, in order: cpu, mem, net, disk, gpu, temp.",
+        "description": "Which metrics appear in the bar, in order: cpu, mem, net, disk, gpu, gpu2, temp. On a machine with two GPUs, gpu is the discrete card and gpu2 the integrated one.",
         "defaultValue": [
           "cpu",
           "mem",
