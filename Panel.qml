@@ -970,26 +970,36 @@ Panel {
                 // neither a temperature nor a power reading, so its clock is
                 // the only other thing there is to say about it.
                 InfoLine {
+                  visible: clockText !== ""
                   label: "Clock"
-                  value: {
-                    var current = Model.frequency(card.freq)
-                    if (current === "") return ""
-                    var ceiling = Model.frequency(card.freqMax)
-                    return ceiling === "" ? current : current + " of " + ceiling
-                  }
+                  value: clockText
                 }
 
                 InfoLine {
+                  visible: thermalText !== ""
                   label: "Temperature"
-                  value: {
-                    var parts = []
-                    if (card.temp !== null && card.temp !== undefined)
-                      parts.push(Model.temperature(card.temp))
-                    if (card.power !== null && card.power !== undefined)
-                      parts.push(Number(card.power).toFixed(1) + " W")
-                    return parts.join("   ")
-                  }
+                  value: thermalText
                 }
+              }
+
+              // A card reports only what its driver exposes: an integrated GPU
+              // publishes neither a temperature nor a power draw, and a row
+              // with an empty right-hand side reads as a missing reading
+              // rather than an absent one.
+              readonly property string clockText: {
+                var current = Model.frequency(card.freq)
+                if (current === "") return ""
+                var ceiling = Model.frequency(card.freqMax)
+                return ceiling === "" ? current : current + " of " + ceiling
+              }
+
+              readonly property string thermalText: {
+                var parts = []
+                if (card.temp !== null && card.temp !== undefined)
+                  parts.push(Model.temperature(card.temp))
+                if (card.power !== null && card.power !== undefined)
+                  parts.push(Number(card.power).toFixed(1) + " W")
+                return parts.join("   ")
               }
             }
           }
