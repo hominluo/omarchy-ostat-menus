@@ -143,8 +143,12 @@ Two implementation notes worth knowing if you fork this:
 ## What it can read
 
 - **CPU, memory, swap, load, network, disk I/O, filesystem usage** — everywhere.
-- **Temperatures and fans** — whatever `hwmon` exposes. A machine with no sensor
-  drivers loaded simply has no SENSORS section.
+- **Temperatures and fans** — whatever `hwmon` exposes, up to 16 temperatures
+  and 6 fans. A machine with no sensor drivers loaded simply has no SENSORS
+  section. Sensors a chip exposes but does not populate are skipped: a ThinkPad
+  offers eight ACPI temperature inputs and fills two, and the rest read exactly
+  zero with no label. A *labelled* zero is shown, because a chip that names a
+  sensor is reporting a real one.
 - **GPU** — every card the machine has, discrete first. Each vendor keeps its
   utilisation somewhere different:
 
@@ -199,8 +203,9 @@ omarchy-shell shell rescanPlugins
 omarchy plugin enable io.github.hominluo.ostat-menus
 ```
 
-`python3 tests/test_gpu.py` runs the GPU suite; it builds its own `/sys`
-trees in a temp directory, so it passes on a machine with no GPU at all.
+`python3 tests/test_gpu.py` and `python3 tests/test_sensors.py` run the
+suites; both build their own `/sys` trees in a temp directory, so they pass on
+a machine with no GPU and no sensor drivers at all.
 `omarchy plugin validate .` checks the manifest. Saving a file under
 `~/.config/omarchy/plugins/` makes the shell reload the plugin's code, but the
 bar keeps the widget instance it already has — `Component.onCompleted` does
@@ -216,6 +221,7 @@ run `omarchy restart shell` to see the change.
 | `MeterBar.qml` | single-value and segmented usage bars |
 | `Model.js` | unit formatting and threshold helpers |
 | `tests/test_gpu.py` | GPU discovery and sampling, against synthetic `/sys` trees |
+| `tests/test_sensors.py` | hwmon temperatures and fans, against synthetic `/sys` trees |
 
 ## License
 

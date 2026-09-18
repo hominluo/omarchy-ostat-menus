@@ -279,9 +279,8 @@ def mounts():
 
 # ---------------------------------------------------------------- sensors
 
-def hwmon_chips():
+def hwmon_chips(base="/sys/class/hwmon"):
     chips = []
-    base = "/sys/class/hwmon"
     try:
         entries = sorted(os.listdir(base))
     except OSError:
@@ -292,7 +291,7 @@ def hwmon_chips():
     return chips
 
 
-def sensors(detail):
+def sensors(detail, hwmon_base="/sys/class/hwmon"):
     temps = []
     fans = []
     cpu_temp = None
@@ -303,7 +302,7 @@ def sensors(detail):
     # with detail off, when `temps` is not collected at all.
     cpu_candidates = []
 
-    for name, path in hwmon_chips():
+    for name, path in hwmon_chips(hwmon_base):
         try:
             files = os.listdir(path)
         except OSError:
@@ -315,11 +314,20 @@ def sensors(detail):
                 if milli is None:
                     continue
                 value = round(milli / 1000.0, 1)
-                # Some chips report a placeholder 0 or an absurd value when the
-                # sensor is unpopulated; neither is worth showing.
+                # Some chips report an absurd value when the sensor is
+                # unpopulated.
                 if not (-40.0 < value < 150.0):
                     continue
-                label = read_text(f"{path}/{fname[:-6]}_label").strip() or name or fname
+                label = read_text(f"{path}/{fname[:-6]}_label").strip()
+                # Others report a placeholder 0 instead. A ThinkPad exposes
+                # eight ACPI temperature inputs and populates two; the other
+                # six read exactly zero and carry no label, and printing them
+                # both says nothing and costs six of the rows below. A chip
+                # that names a sensor is reporting a real one, so a labelled
+                # zero is believed — a machine really can sit at freezing.
+                if value == 0.0 and not label:
+                    continue
+                label = label or name or fname
                 is_package = label.lower().startswith(("package", "tctl", "tdie", "cpu"))
                 if name in ("coretemp", "k10temp", "zenpower") and cpu_temp is None and is_package:
                     cpu_temp = value
@@ -342,7 +350,7 @@ def sensors(detail):
     if cpu_temp is None and cpu_candidates:
         cpu_temp = max(cpu_candidates)
 
-    return {"cpuTemp": cpu_temp, "gpuTemp": gpu_temp, "temps": temps[:12], "fans": fans[:6]}
+    return {"cpuTemp": cpu_temp, "gpuTemp": gpu_temp, "temps": temps[:16], "fans": fans[:6]}
 
 
 # ---------------------------------------------------------------- gpu
