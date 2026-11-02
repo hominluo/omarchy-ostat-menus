@@ -38,15 +38,24 @@ Panel {
   property bool connected: false
   property string sensorError: ""
   property string processSort: "cpu"
+  // Baseline for the "Session" traffic figures: /proc/net/dev counts since the
+  // interface came up, not since this panel did. Model.sessionBase() re-takes
+  // it when the sampler starts reporting a different interface.
+  property var netBase: null
 
   property var cpuHistory: []
   property var memHistory: []
   property var rxHistory: []
   property var txHistory: []
-  // One ring per GPU, in payload order. gpuHistory stays as the first
-  // card's ring so the bar cell keeps its existing binding.
-  property var gpuHistories: []
-  readonly property var gpuHistory: gpuHistories.length > 0 ? gpuHistories[0] : []
+  // One ring per card, keyed by the stable id the sampler puts on each
+  // reading. A probe can skip a tick (an RC6 counter reset across a suspend,
+  // a counter that stops answering), and an index-keyed ring would hand one
+  // card's history to whichever card moved up into its slot.
+  property var gpuRings: ({})
+  readonly property var gpuHistory: {
+    var card = gpuList.length > 0 ? gpuList[0] : null
+    return card && gpuRings[card.id] ? gpuRings[card.id] : []
+  }
 
   readonly property color foreground: bar ? bar.foreground : Color.foreground
   readonly property color urgent: bar ? bar.urgent : Color.urgent
@@ -71,6 +80,8 @@ Panel {
   readonly property var fans: sample.fans || []
   readonly property var processRows: (processSort === "mem" ? sample.procMem : sample.procCpu) || []
   readonly property real cpuTemp: sample.cpuTemp === null || sample.cpuTemp === undefined ? -1 : Number(sample.cpuTemp)
+  readonly property bool cpuTempIsPackage: sample.cpuTempFrom === "package"
+  readonly property var session: Model.sessionTotals(netBase, sample.net)
 
   // ------------------------------------------------------------- sampling
 
@@ -104,6 +115,7 @@ Panel {
     connected = true
     sensorError = ""
     sample = payload
+    netBase = Model.sessionBase(netBase, payload.net)
 
     cpuHistory = Model.pushSample(cpuHistory, payload.cpu, historySize)
     memHistory = Model.pushSample(memHistory, Model.fraction(payload.mem ? payload.mem.used : 0,
@@ -112,14 +124,12 @@ Panel {
     txHistory = Model.pushSample(txHistory, payload.net ? payload.net.tx : 0, historySize)
     var cards = payload.gpus || (payload.gpu ? [payload.gpu] : [])
     if (cards.length > 0) {
-      var rings = gpuHistories.slice()
-      // A card can appear or disappear across a suspend, so the rings are
-      // grown and trimmed to whatever this tick reported.
-      while (rings.length < cards.length) rings.push([])
-      rings.length = cards.length
-      for (var i = 0; i < cards.length; i++)
-        rings[i] = Model.pushSample(rings[i], cards[i].busy, historySize)
-      gpuHistories = rings
+      var rings = {}
+      for (var i = 0; i < cards.length; i++) {
+        var id = cards[i].id || ("gpu" + i)
+        rings[id] = Model.pushSample(gpuRings[id] || [], cards[i].busy, historySize)
+      }
+      gpuRings = rings
     }
   }
 
@@ -190,6 +200,22 @@ Panel {
     panelFlick.contentY = Math.max(0, Math.min(maxY, panelFlick.contentY + steps * Style.space(48)))
   }
 
+  // The plugin facade hands out showTooltip() but nothing that replaces the text
+  // of a bubble that is already up. Calling showTooltip() again would work, but
+  // it hides the bubble and re-runs the 400ms reveal, so the tooltip would
+  // blink on every tick. Walk up to the host bar item and rewrite the string in
+  // place; if the host ever stops exposing it, the tooltip just keeps the
+  // figure it was given on hover, which is the old behaviour.
+  function hostBarForTooltip() {
+    var item = root.parent
+    while (item) {
+      if (item.tooltipText !== undefined && item.tooltipTarget !== undefined)
+        return item
+      item = item.parent
+    }
+    return null
+  }
+
   function openMonitor() {
     if (bar) bar.run(terminalCommand)
     close()
@@ -210,6 +236,14 @@ Panel {
     tooltipText: root.connected
       ? "CPU " + Model.percent(root.cpuValue) + " · MEM " + Model.percent(root.memValue)
       : "System monitor (starting…)"
+    // Bar.showTooltip() copies the text when the pointer arrives, so a tooltip
+    // that tracks a live figure would sit on the value it had at hover-enter.
+    onTooltipTextChanged: {
+      if (!tooltipHovered) return
+      var host = root.hostBarForTooltip()
+      if (host && host.tooltipTarget === button && host.tooltipShown)
+        host.tooltipText = tooltipText
+    }
     onPressed: function(buttonCode) {
       if (buttonCode === Qt.RightButton) root.openMonitor()
       else root.toggle()
@@ -284,8 +318,8 @@ Panel {
   }
 
   function gpuRing(kind) {
-    var index = kind === "gpu" ? 0 : (kind === "gpu2" ? 1 : -1)
-    return index >= 0 && gpuHistories.length > index ? gpuHistories[index] : []
+    var card = gpuAt(kind)
+    return card && card.id ? (gpuRings[card.id] || []) : []
   }
 
   function cellGlyph(kind) {
@@ -687,7 +721,10 @@ Panel {
                 anchors.right: parent.right
                 visible: root.cpuTemp >= 0
                 textFormat: Text.PlainText
-                text: Model.temperature(root.cpuTemp) + " package"
+                // "package" only when a chip actually labelled one; the
+                // fallback is the hottest core or chassis zone.
+                text: Model.temperature(root.cpuTemp)
+                  + (root.cpuTempIsPackage ? " package" : " max")
                 color: root.foreground
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.bodySmall
@@ -839,7 +876,7 @@ Panel {
 
           InfoLine {
             label: "Session"
-            value: "󰇚 " + Model.bytes(root.netInfo.rxTotal) + "   󰕒 " + Model.bytes(root.netInfo.txTotal)
+            value: "󰇚 " + Model.bytes(root.session.rx) + "   󰕒 " + Model.bytes(root.session.tx)
           }
 
           // ---------------------------------------------------------- disk

@@ -121,10 +121,12 @@ detail <0|1>          include the process table, mount usage and the full
                       temperature list, or skip them
 ```
 
-`detail` is off while the panel is closed, so walking every `/proc/<pid>` only
-happens when someone is looking at the result. That walk is the expensive part
-of a tick — about 14ms against 1ms for everything else on a 300-process
-machine — which is the whole reason for the switch.
+`detail` is off while the panel is closed: the process walk, mount usage, the
+full temperature list and the fans all go away, and only the sensor chips that
+can yield a CPU or GPU temperature are read. That second part matters on a
+laptop, where `dell_smm`, `BAT0`, `nvme` and the USB-C ports are ACPI calls —
+32ms a tick, against 0.7ms with them skipped. With the panel open the walk
+dominates instead: about 20ms for 800 tasks here, and 35ms for the whole tick.
 
 Run it by hand to see the shape of a sample:
 
@@ -154,9 +156,13 @@ Two implementation notes worth knowing if you fork this:
 
   | Vendor | Source | What you get |
   |---|---|---|
-  | AMD | `gpu_busy_percent` in sysfs | utilisation, VRAM, temperature, power |
+  | AMD | `gpu_busy_percent` in sysfs | utilisation, VRAM, temperature, power, clock |
   | NVIDIA | NVML, called through `ctypes` | utilisation, VRAM, temperature, power, clock |
   | Intel | RC6 residency in sysfs | utilisation, clock |
+
+  AMD's clock comes from the active DPM state in `pp_dpm_sclk`, which is a
+  small table rather than a single number; the highest state is reported as
+  the ceiling so the panel can show "1200 MHz of 1455".
 
   The proprietary NVIDIA driver publishes no utilisation counter in sysfs and
   registers no `hwmon` chip, so NVML is the only source; it is loaded as a
@@ -181,7 +187,8 @@ A few numbers are computed rather than copied, and the definitions matter:
   "Free" is therefore `MemFree`, which on a warm machine is nearly nothing —
   the number you actually want is on the **Available** row.
 - **Btrfs subvolumes and bind mounts collapse to one row per pool.** Listing
-  `/`, `/home` and `/var/log` with three identical bars says nothing.
+  `/`, `/home` and `/var/log` with three identical bars says nothing; the
+  shortest path in the pool is the one that survives.
 
 ## Notes
 
@@ -203,9 +210,9 @@ omarchy-shell shell rescanPlugins
 omarchy plugin enable io.github.hominluo.ostat-menus
 ```
 
-`python3 tests/test_gpu.py` and `python3 tests/test_sensors.py` run the
-suites; both build their own `/sys` trees in a temp directory, so they pass on
-a machine with no GPU and no sensor drivers at all.
+`./check` runs the suites (see [Tests](#tests)); they build their own `/sys`
+trees in a temp directory, so they pass on a machine with no GPU and no sensor
+drivers at all.
 `omarchy plugin validate .` checks the manifest. Saving a file under
 `~/.config/omarchy/plugins/` makes the shell reload the plugin's code, but the
 bar keeps the widget instance it already has — `Component.onCompleted` does
@@ -221,7 +228,29 @@ run `omarchy restart shell` to see the change.
 | `MeterBar.qml` | single-value and segmented usage bars |
 | `Model.js` | unit formatting and threshold helpers |
 | `tests/test_gpu.py` | GPU discovery and sampling, against synthetic `/sys` trees |
-| `tests/test_sensors.py` | hwmon temperatures and fans, against synthetic `/sys` trees |
+| `tests/` | fixture-driven tests for `sensors.py`, the GPU probes and `Model.js` |
+| `check` | every check in one command (see below) |
+
+## Tests
+
+`./check` runs the lot: `compileall`, the Python tests, the `Model.js` tests
+under node, `qmllint` against the installed shell, and
+`omarchy plugin validate`. Nothing outside a base Arch install is needed —
+`unittest` and `node:test` are both stdlib.
+
+Individually:
+
+```bash
+python3 -m unittest discover -s tests -t .   # sensors.py parsing
+node --test tests/                           # Model.js helpers
+```
+
+`tests/test_sensors.py` drives the sampler through fixture strings and a
+throwaway `hwmon` tree, so it passes on a machine with no sensors at all — the
+`/proc` and `/sys` reads are patched per test, never taken from the host.
+`tests/test_gpu.py` does the same for the AMD, Intel and NVIDIA probes, and
+`tests/model.test.js` loads `Model.js` directly; the guarded `module.exports`
+at the bottom of that file is what makes it loadable outside QML.
 
 ## License
 

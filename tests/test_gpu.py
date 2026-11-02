@@ -7,10 +7,12 @@ runs the same way on a machine with no GPU, one GPU, or four.
     python3 tests/test_gpu.py
 """
 
+import ctypes
 import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -140,6 +142,21 @@ class AmdGpuTest(unittest.TestCase):
         os.remove(f"{device}/gpu_busy_percent")
         self.assertIsNone(sensors.AmdGpu(device, "Radeon").sample(1.0))
 
+    def test_the_active_dpm_state_is_the_clock(self):
+        # pp_dpm_sclk lists the states and stars the active one; read_int()
+        # over the whole file returned None, so the Clock row was always empty.
+        device = make_amd_card(self.base, "card0")
+        write(f"{device}/pp_dpm_sclk", "0: 200Mhz\n1: 1200Mhz *\n2: 1455Mhz\n")
+        reading = sensors.AmdGpu(device, "Radeon").sample(1.0)
+        self.assertEqual(reading["freq"], 1200)
+        self.assertEqual(reading["freqMax"], 1455)
+
+    def test_no_dpm_file_leaves_the_clock_empty(self):
+        device = make_amd_card(self.base, "card0")
+        reading = sensors.AmdGpu(device, "Radeon").sample(1.0)
+        self.assertIsNone(reading["freq"])
+        self.assertIsNone(reading["freqMax"])
+
 
 class IntelGpuTest(unittest.TestCase):
     def setUp(self):
@@ -176,11 +193,13 @@ class IntelGpuTest(unittest.TestCase):
         write(f"{device}/drm/card1/gt/gt0/rc6_residency_ms", 510)
         self.assertAlmostEqual(probe.sample(1.0)["busy"], 50.0, places=1)
 
-    def test_first_tick_has_no_previous_sample(self):
+    def test_the_first_tick_measures_against_the_construction_baseline(self):
         device = make_intel_card(self.base, "card1", rc6=1000)
         probe = sensors.IntelGpu(device, "card1", "Intel")
-        # Same counter value: nothing ran, so the reading is a real zero.
-        self.assertIsNotNone(probe.sample(1.0))
+        # The probe takes its baseline when it is created, so the first tick
+        # is a real reading rather than a missing one.
+        write(f"{device}/drm/card1/gt/gt0/rc6_residency_ms", 2000)
+        self.assertAlmostEqual(probe.sample(1.0)["busy"], 0.0, places=1)
 
     def test_reports_frequency_and_no_vram(self):
         device = make_intel_card(self.base, "card1", act=450, rp0=1150)
@@ -220,6 +239,77 @@ class NvidiaGpuTest(unittest.TestCase):
     def test_a_failed_read_yields_no_reading(self):
         nvml = FakeNvml([None])
         self.assertIsNone(sensors.NvidiaGpu(nvml, 0).sample(1.0))
+
+
+class FakeNvmlLibrary(object):
+    """A stand-in for libnvidia-ml, exporting only what it is given.
+
+    Older drivers have no `_v2` entry points, and a stripped library can be
+    missing an optional counter. Reaching for the symbol directly raised
+    AttributeError, which the sampler treats as "no card at all".
+    """
+
+    def __init__(self, **symbols):
+        for name, function in symbols.items():
+            setattr(self, name, function)
+
+
+def nvml_count(total):
+    def count(out):
+        out._obj.value = total
+        return 0
+    return count
+
+
+def nvml_handle(index=0):
+    def get_handle(number, out):
+        out._obj.value = number + 1
+        return 0
+    return get_handle
+
+
+class NvmlBindingTest(unittest.TestCase):
+    def test_a_library_without_v2_symbols_still_opens(self):
+        library = FakeNvmlLibrary(nvmlDeviceGetCount=nvml_count(1),
+                                  nvmlDeviceGetHandleByIndex=nvml_handle())
+        probe = sensors.Nvml(library)
+        self.assertTrue(probe.open_devices())
+        self.assertEqual(probe.device_count(), 1)
+
+    def test_load_falls_back_to_the_original_init(self):
+        library = FakeNvmlLibrary(nvmlInit=lambda: 0,
+                                  nvmlDeviceGetCount=nvml_count(1),
+                                  nvmlDeviceGetHandleByIndex=nvml_handle())
+        with mock.patch.object(ctypes, "CDLL", lambda soname: library):
+            probe = sensors.Nvml.load()
+        self.assertIsNotNone(probe)
+        self.assertEqual(probe.device_count(), 1)
+
+    def test_a_library_without_any_init_is_not_an_error(self):
+        library = FakeNvmlLibrary(nvmlDeviceGetCount=nvml_count(1))
+        with mock.patch.object(ctypes, "CDLL", lambda soname: library):
+            self.assertIsNone(sensors.Nvml.load())
+
+    def test_sample_survives_missing_optional_symbols(self):
+        def utilisation(handle, out):
+            out._obj.gpu = 23
+            out._obj.memory = 7
+            return 0
+
+        probe = sensors.Nvml(FakeNvmlLibrary(nvmlDeviceGetUtilizationRates=utilisation))
+        probe.handles = [ctypes.c_void_p(1)]
+        values = probe.sample(0)
+        self.assertEqual(values["busy"], 23)
+        self.assertEqual(values["name"], "NVIDIA GPU")
+        self.assertIsNone(values["temp"])
+        self.assertIsNone(values["power"])
+        self.assertIsNone(values["freq"])
+        self.assertEqual(values["vramTotal"], 0)
+
+    def test_sample_without_a_utilisation_counter_yields_nothing(self):
+        probe = sensors.Nvml(FakeNvmlLibrary())
+        probe.handles = [ctypes.c_void_p(1)]
+        self.assertIsNone(probe.sample(0))
 
 
 class DiscoveryTest(unittest.TestCase):
@@ -307,10 +397,22 @@ class PayloadShapeTest(unittest.TestCase):
     def test_no_gpu_leaves_the_legacy_field_null(self):
         self.assertIsNone(sensors.primary_gpu([]))
 
+    def test_each_card_carries_a_stable_id(self):
+        # The panel keys its history on this, so a card that misses a tick
+        # must not hand its ring to the card that moves up a slot.
+        make_amd_card(self.base, "card0")
+        make_intel_card(self.base, "card1")
+        probes = sensors.discover_gpus(self.base, None)
+        first = sensors.sample_gpus(probes, 1.0)
+        second = sensors.sample_gpus(probes, 1.0)
+        self.assertEqual([r["id"] for r in first], [r["id"] for r in second])
+        self.assertEqual(len({r["id"] for r in first}), 2)
+        self.assertTrue(all(r["id"] for r in first))
+
     def test_every_reading_carries_the_full_key_set(self):
         make_amd_card(self.base, "card0")
         make_intel_card(self.base, "card1")
-        expected = {"name", "vendor", "busy", "vramUsed", "vramTotal",
+        expected = {"id", "name", "vendor", "busy", "vramUsed", "vramTotal",
                     "power", "temp", "freq", "freqMax", "integrated"}
         for reading in sensors.sample_gpus(sensors.discover_gpus(self.base, None), 1.0):
             self.assertEqual(set(reading), expected)

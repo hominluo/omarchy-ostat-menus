@@ -11,11 +11,13 @@ of the parts nobody is looking at:
 
     interval <seconds>   change the sampling period (0.25 .. 60)
     detail <0|1>         include the expensive fields (process table, mount
-                         usage, per-core temperatures) or skip them
+                         usage, the full temperature list, fans) or skip them
 
 `detail 0` is the closed-panel mode. The bar itself only renders the cheap
 aggregate fields, and walking every /proc/<pid> once a second to feed a panel
 that is not on screen is the one genuinely wasteful thing this script could do.
+With detail off only the sensor chips that can supply a CPU or GPU temperature
+are read, for the same reason: the rest are ACPI calls.
 """
 
 import errno
@@ -41,6 +43,8 @@ REAL_FS = {
 
 # Mount trees that are real filesystems but never interesting as "my disks".
 SKIP_MOUNT_PREFIXES = ("/snap", "/var/lib/docker", "/var/lib/containers", "/run")
+# ... except where udisks parks removable media, which is a real disk.
+KEEP_MOUNT_PREFIXES = ("/run/media/",)
 
 # Block devices that are not physical disks. zram is compressed RAM and
 # already shows up under swap; counting its I/O as disk traffic is a lie.
@@ -51,7 +55,9 @@ def read_text(path, default=""):
     try:
         with open(path, "r") as handle:
             return handle.read()
-    except OSError:
+    except (OSError, UnicodeError):
+        # UnicodeError as well as OSError: one driver or /proc line that is not
+        # valid UTF-8 must not take the sampler — and with it the widget — down.
         return default
 
 
@@ -92,8 +98,16 @@ def read_cpu_times():
         if not line.startswith("cpu"):
             break
         parts = line.split()
+        try:
+            values = [int(v) for v in parts[1:]]
+        except ValueError:
+            continue
+        # user nice system idle [iowait ...]. A truncated line used to raise
+        # IndexError out of main(), which the widget answers by restarting the
+        # sampler — and killing it again on the next tick.
+        if len(values) < 4:
+            continue
         key = parts[0]
-        values = [int(v) for v in parts[1:]]
         # user nice system idle iowait irq softirq steal guest guest_nice.
         # Idle time is idle + iowait; guest time is already counted inside
         # user/nice, so summing every field would double-count it.
@@ -199,7 +213,10 @@ def net_counters():
         parts = rest.split()
         if len(parts) < 9:
             continue
-        per_iface[name] = (int(parts[0]), int(parts[8]))
+        try:
+            per_iface[name] = (int(parts[0]), int(parts[8]))
+        except ValueError:
+            continue
     return per_iface
 
 
@@ -220,15 +237,32 @@ def disk_counters():
         # have a /sys/block entry of their own.
         if not os.path.isdir(f"/sys/block/{name}"):
             continue
-        read_sectors += int(parts[5])
-        write_sectors += int(parts[9])
+        try:
+            read = int(parts[5])
+            written = int(parts[9])
+        except ValueError:
+            continue
+        read_sectors += read
+        write_sectors += written
     return read_sectors * SECTOR_SIZE, write_sectors * SECTOR_SIZE
 
 
+def skipped_mount(target):
+    """True for real filesystems that are not "my disks".
+
+    Prefixes match on a path boundary, so "/run" hides /run and /run/user but
+    not /run/media/<user>/<label>, which is where udisks mounts a USB stick.
+    """
+    if target.startswith(KEEP_MOUNT_PREFIXES):
+        return False
+    for prefix in SKIP_MOUNT_PREFIXES:
+        if target == prefix or target.startswith(prefix + "/"):
+            return True
+    return False
+
+
 def mounts():
-    seen = set()
-    seen_pools = set()
-    out = []
+    seen_pools = {}
     for line in read_text("/proc/self/mountinfo").splitlines():
         head, _, tail = line.partition(" - ")
         if not tail:
@@ -242,9 +276,7 @@ def mounts():
         source = tail_parts[1]
         if fstype not in REAL_FS:
             continue
-        if target.startswith(SKIP_MOUNT_PREFIXES):
-            continue
-        if target in seen:
+        if skipped_mount(target):
             continue
         try:
             st = os.statvfs(target)
@@ -259,21 +291,22 @@ def mounts():
         # Btrfs subvolumes and bind mounts are separate mountinfo entries that
         # all report the same pool. Listing /, /home, /var/log and
         # /var/cache/pacman/pkg with four identical bars says nothing; keep the
-        # shortest path per pool, which mountinfo order makes the first seen.
+        # shortest path per pool. mountinfo order is not a promise — this used
+        # to keep whatever came first — so a later, shorter path replaces the
+        # incumbent.
         pool = (source, total, free)
-        if pool in seen_pools:
+        kept = seen_pools.get(pool)
+        if kept is not None and len(kept["path"]) <= len(target):
             continue
-        seen_pools.add(pool)
-        seen.add(target)
-        out.append({
+        seen_pools[pool] = {
             "path": target,
             "device": source,
             "fstype": fstype,
             "total": total,
             "used": max(0, total - free),
             "free": free,
-        })
-    out.sort(key=lambda m: (len(m["path"]), m["path"]))
+        }
+    out = sorted(seen_pools.values(), key=lambda m: (len(m["path"]), m["path"]))
     return out[:6]
 
 
@@ -291,10 +324,22 @@ def hwmon_chips(base="/sys/class/hwmon"):
     return chips
 
 
+# Chip names that label a package sensor: "Package id 0", "Tctl", "Tdie".
+PACKAGE_CHIPS = ("coretemp", "k10temp", "zenpower")
+# Readings that can stand in for the package temperature when nothing labels
+# one. These, plus the GPU chips, are also the only chips worth reading with
+# detail off: on a laptop everything else (nvme, BAT0, ucsi, iwlwifi,
+# dell_smm) goes through ACPI or SMM and costs more per tick than the whole
+# process walk this script exists to avoid.
+CPU_CHIPS = PACKAGE_CHIPS + ("acpitz",)
+GPU_CHIPS = ("amdgpu", "nouveau", "nvidia", "i915", "xe")
+
+
 def sensors(detail, hwmon_base="/sys/class/hwmon"):
     temps = []
     fans = []
     cpu_temp = None
+    cpu_temp_from = None
     gpu_temp = None
 
     # Readings that can stand in for the package temperature when no chip
@@ -303,6 +348,8 @@ def sensors(detail, hwmon_base="/sys/class/hwmon"):
     cpu_candidates = []
 
     for name, path in hwmon_chips(hwmon_base):
+        if not detail and name not in CPU_CHIPS and name not in GPU_CHIPS:
+            continue
         try:
             files = os.listdir(path)
         except OSError:
@@ -318,6 +365,7 @@ def sensors(detail, hwmon_base="/sys/class/hwmon"):
                 # unpopulated.
                 if not (-40.0 < value < 150.0):
                     continue
+                index = fname[4:-6]
                 label = read_text(f"{path}/{fname[:-6]}_label").strip()
                 # Others report a placeholder 0 instead. A ThinkPad exposes
                 # eight ACPI temperature inputs and populates two; the other
@@ -327,13 +375,20 @@ def sensors(detail, hwmon_base="/sys/class/hwmon"):
                 # zero is believed — a machine really can sit at freezing.
                 if value == 0.0 and not label:
                     continue
-                label = label or name or fname
+                if not label:
+                    # A chip with several unlabelled inputs (dell_smm, some
+                    # boards) would print one identical row per input; carry
+                    # the input number. A single input already names itself.
+                    inputs = sum(1 for f in files
+                                 if f.startswith("temp") and f.endswith("_input"))
+                    label = f"{name or 'sensor'} {index}" if inputs > 1 else (name or fname)
                 is_package = label.lower().startswith(("package", "tctl", "tdie", "cpu"))
-                if name in ("coretemp", "k10temp", "zenpower") and cpu_temp is None and is_package:
+                if name in PACKAGE_CHIPS and cpu_temp is None and is_package:
                     cpu_temp = value
-                if name in ("amdgpu", "nouveau", "nvidia", "i915", "xe") and gpu_temp is None:
+                    cpu_temp_from = "package"
+                if name in GPU_CHIPS and gpu_temp is None:
                     gpu_temp = value
-                if name in ("coretemp", "k10temp", "zenpower", "acpitz"):
+                if name in CPU_CHIPS:
                     cpu_candidates.append(value)
                 if detail:
                     temps.append({"chip": name, "label": label, "value": value})
@@ -346,11 +401,14 @@ def sensors(detail, hwmon_base="/sys/class/hwmon"):
                 fans.append({"chip": name, "label": label, "value": rpm})
 
     # No labelled package sensor: fall back to the hottest core-ish reading so
-    # the hero still has a temperature to show.
+    # the hero still has a temperature to show. The panel needs to know which
+    # of the two it got, or it calls a chassis zone a package.
     if cpu_temp is None and cpu_candidates:
         cpu_temp = max(cpu_candidates)
+        cpu_temp_from = "max"
 
-    return {"cpuTemp": cpu_temp, "gpuTemp": gpu_temp, "temps": temps[:16], "fans": fans[:6]}
+    return {"cpuTemp": cpu_temp, "cpuTempFrom": cpu_temp_from,
+            "gpuTemp": gpu_temp, "temps": temps[:16], "fans": fans[:6]}
 
 
 # ---------------------------------------------------------------- gpu
@@ -448,9 +506,16 @@ def pci_name(device, fallback):
 
 def reading(name, vendor, busy, integrated,
             vram_used=0, vram_total=0, power=None, temp=None,
-            freq=None, freq_max=None):
-    """The one shape every probe returns, so the panel can render them alike."""
+            freq=None, freq_max=None, key=None):
+    """The one shape every probe returns, so the panel can render them alike.
+
+    `id` names the card, not its position: a probe can skip a tick (an RC6
+    counter reset across a suspend, a busy read that fails), and the panel
+    keys its history on this so one card's history is never handed to
+    another that moved up a slot.
+    """
     return {
+        "id": key,
         "name": name,
         "vendor": vendor,
         "busy": round(float(busy), 1),
@@ -473,11 +538,38 @@ class AmdGpu(object):
     def __init__(self, device, name):
         self.device = device
         self.name = name
+        self.key = "amd:" + device
 
     @staticmethod
     def counter_path(device):
         path = f"{device}/gpu_busy_percent"
         return path if os.path.exists(path) else None
+
+    @staticmethod
+    def dpm_clock(device):
+        """The active DPM state and the highest one, in MHz.
+
+        `pp_dpm_sclk` is not a number: it lists the states one per line and
+        marks the one in use with '*', as in "1: 1200Mhz *". read_int() sees
+        the whole file, so the clock was always empty; the digit run after
+        the colon is the reading.
+        """
+        active = None
+        ceiling = None
+        for line in read_text(f"{device}/pp_dpm_sclk").splitlines():
+            digits = ""
+            for character in line.split(":", 1)[-1]:
+                if character.isdigit():
+                    digits += character
+                elif digits:
+                    break
+            if not digits:
+                continue
+            mhz = int(digits)
+            ceiling = mhz if ceiling is None else max(ceiling, mhz)
+            if "*" in line:
+                active = mhz
+        return active, ceiling
 
     def sample(self, elapsed):
         busy = read_int(f"{self.device}/gpu_busy_percent")
@@ -498,13 +590,16 @@ class AmdGpu(object):
                 break
         except OSError:
             pass
+        freq, freq_max = self.dpm_clock(self.device)
         return reading(
             self.name, self.vendor, busy, self.integrated,
             vram_used=read_int(f"{self.device}/mem_info_vram_used", 0) or 0,
             vram_total=read_int(f"{self.device}/mem_info_vram_total", 0) or 0,
             power=power,
             temp=temp,
-            freq=(read_int(f"{self.device}/pp_dpm_sclk") or None),
+            freq=freq,
+            freq_max=freq_max,
+            key=self.key,
         )
 
 
@@ -524,6 +619,7 @@ class IntelGpu(object):
     def __init__(self, device, card, name):
         self.device = device
         self.name = name
+        self.key = "intel:" + device
         self.residency = self.residency_path(device, card)
         self.freq_paths = self.frequency_paths(device, card)
         self.previous = read_int(self.residency) if self.residency else None
@@ -572,6 +668,7 @@ class IntelGpu(object):
             self.name, self.vendor, busy, self.integrated,
             freq=read_int(self.freq_paths[0]),
             freq_max=read_int(self.freq_paths[1]),
+            key=self.key,
         )
 
 
@@ -591,6 +688,21 @@ class Nvml(object):
         self.library = library
         self.handles = []
 
+    @staticmethod
+    def symbol(library, *names):
+        """The first of `names` this library exports, or None.
+
+        NVML renamed its entry points to a `_v2` suffix without removing the
+        originals, and a library from before that has only the short names.
+        Reaching for the symbol directly raised AttributeError on older
+        drivers; NVML is optional, so a missing symbol is answered, not raised.
+        """
+        for name in names:
+            function = getattr(library, name, None)
+            if function is not None:
+                return function
+        return None
+
     @classmethod
     def load(cls):
         try:
@@ -602,7 +714,8 @@ class Nvml(object):
                 library = ctypes.CDLL(soname)
             except OSError:
                 continue
-            if library.nvmlInit_v2() != 0:
+            init = cls.symbol(library, "nvmlInit_v2", "nvmlInit")
+            if init is None or init() != 0:
                 continue
             instance = cls(library)
             if instance.open_devices():
@@ -612,12 +725,18 @@ class Nvml(object):
 
     def open_devices(self):
         import ctypes
+        count_devices = self.symbol(self.library, "nvmlDeviceGetCount_v2",
+                                    "nvmlDeviceGetCount")
+        get_handle = self.symbol(self.library, "nvmlDeviceGetHandleByIndex_v2",
+                                 "nvmlDeviceGetHandleByIndex")
+        if count_devices is None or get_handle is None:
+            return False
         count = ctypes.c_uint()
-        if self.library.nvmlDeviceGetCount_v2(ctypes.byref(count)) != 0:
+        if count_devices(ctypes.byref(count)) != 0:
             return False
         for index in range(count.value):
             handle = ctypes.c_void_p()
-            if self.library.nvmlDeviceGetHandleByIndex_v2(index, ctypes.byref(handle)) == 0:
+            if get_handle(index, ctypes.byref(handle)) == 0:
                 self.handles.append(handle)
         return bool(self.handles)
 
@@ -636,36 +755,42 @@ class Nvml(object):
                         ("used", ctypes.c_ulonglong)]
 
         handle = self.handles[index]
+        utilisation = self.symbol(self.library, "nvmlDeviceGetUtilizationRates")
         used = Utilisation()
-        if self.library.nvmlDeviceGetUtilizationRates(handle, ctypes.byref(used)) != 0:
+        if utilisation is None or utilisation(handle, ctypes.byref(used)) != 0:
             return None
 
-        name = ctypes.create_string_buffer(96)
-        if self.library.nvmlDeviceGetName(handle, name, ctypes.c_uint(96)) == 0:
-            label = name.value.decode("utf-8", "replace").strip() or "NVIDIA GPU"
-        else:
-            label = "NVIDIA GPU"
+        label = "NVIDIA GPU"
+        get_name = self.symbol(self.library, "nvmlDeviceGetName")
+        if get_name is not None:
+            name = ctypes.create_string_buffer(96)
+            if get_name(handle, name, ctypes.c_uint(96)) == 0:
+                label = name.value.decode("utf-8", "replace").strip() or label
 
         memory = Memory()
         vram_used = vram_total = 0
-        if self.library.nvmlDeviceGetMemoryInfo(handle, ctypes.byref(memory)) == 0:
+        get_memory = self.symbol(self.library, "nvmlDeviceGetMemoryInfo")
+        if get_memory is not None and get_memory(handle, ctypes.byref(memory)) == 0:
             vram_used = memory.used
             vram_total = memory.total
 
         celsius = ctypes.c_uint()
         temp = None
-        if self.library.nvmlDeviceGetTemperature(
+        get_temp = self.symbol(self.library, "nvmlDeviceGetTemperature")
+        if get_temp is not None and get_temp(
                 handle, self.TEMPERATURE_GPU, ctypes.byref(celsius)) == 0:
             temp = float(celsius.value)
 
         milli_watts = ctypes.c_uint()
         power = None
-        if self.library.nvmlDeviceGetPowerUsage(handle, ctypes.byref(milli_watts)) == 0:
+        get_power = self.symbol(self.library, "nvmlDeviceGetPowerUsage")
+        if get_power is not None and get_power(handle, ctypes.byref(milli_watts)) == 0:
             power = round(milli_watts.value / 1000.0, 1)
 
         megahertz = ctypes.c_uint()
         freq = None
-        if self.library.nvmlDeviceGetClockInfo(
+        get_clock = self.symbol(self.library, "nvmlDeviceGetClockInfo")
+        if get_clock is not None and get_clock(
                 handle, self.CLOCK_GRAPHICS, ctypes.byref(megahertz)) == 0:
             freq = megahertz.value
 
@@ -694,6 +819,7 @@ class NvidiaGpu(object):
     def __init__(self, nvml, index):
         self.nvml = nvml
         self.index = index
+        self.key = "nvidia:%d" % index
 
     def sample(self, elapsed):
         try:
@@ -707,6 +833,7 @@ class NvidiaGpu(object):
             vram_used=values["vramUsed"], vram_total=values["vramTotal"],
             power=values["power"], temp=values["temp"],
             freq=values["freq"], freq_max=values["freqMax"],
+            key=self.key,
         )
 
 
