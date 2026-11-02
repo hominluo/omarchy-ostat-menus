@@ -117,10 +117,12 @@ detail <0|1>          include the process table, mount usage and the full
                       temperature list, or skip them
 ```
 
-`detail` is off while the panel is closed, so walking every `/proc/<pid>` only
-happens when someone is looking at the result. That walk is the expensive part
-of a tick — about 14ms against 1ms for everything else on a 300-process
-machine — which is the whole reason for the switch.
+`detail` is off while the panel is closed: the process walk, mount usage, the
+full temperature list and the fans all go away, and only the sensor chips that
+can yield a CPU or GPU temperature are read. That second part matters on a
+laptop, where `dell_smm`, `BAT0`, `nvme` and the USB-C ports are ACPI calls —
+32ms a tick, against 0.7ms with them skipped. With the panel open the walk
+dominates instead: about 20ms for 800 tasks here, and 35ms for the whole tick.
 
 Run it by hand to see the shape of a sample:
 
@@ -158,7 +160,8 @@ A few numbers are computed rather than copied, and the definitions matter:
   "Free" is therefore `MemFree`, which on a warm machine is nearly nothing —
   the number you actually want is on the **Available** row.
 - **Btrfs subvolumes and bind mounts collapse to one row per pool.** Listing
-  `/`, `/home` and `/var/log` with three identical bars says nothing.
+  `/`, `/home` and `/var/log` with three identical bars says nothing; the
+  shortest path in the pool is the one that survives.
 
 ## Notes
 
@@ -192,6 +195,28 @@ run `omarchy restart shell` to see the change.
 | `Sparkline.qml` | history graph — area fill, stroked line, fixed time base |
 | `MeterBar.qml` | single-value and segmented usage bars |
 | `Model.js` | unit formatting and threshold helpers |
+| `tests/` | fixture-driven tests for `sensors.py` and `Model.js` |
+| `check` | every check in one command (see below) |
+
+## Tests
+
+`./check` runs the lot: `compileall`, the Python tests, the `Model.js` tests
+under node, `qmllint` against the installed shell, and
+`omarchy plugin validate`. Nothing outside a base Arch install is needed —
+`unittest` and `node:test` are both stdlib.
+
+Individually:
+
+```bash
+python3 -m unittest discover -s tests -t .   # sensors.py parsing
+node --test tests/                           # Model.js helpers
+```
+
+`tests/test_sensors.py` drives the sampler through fixture strings and a
+throwaway `hwmon` tree, so it passes on a machine with no sensors at all — the
+`/proc` and `/sys` reads are patched per test, never taken from the host.
+`tests/model.test.js` loads `Model.js` directly; the guarded `module.exports`
+at the bottom of that file is what makes it loadable outside QML.
 
 ## License
 

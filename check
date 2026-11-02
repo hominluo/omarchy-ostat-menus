@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# Run every check this repository knows how to run.
+set -euo pipefail
+cd "$(dirname "$0")"
+
+# Bytecode stays out of the plugin folder; the shell reloads on every write here.
+export PYTHONPYCACHEPREFIX="${XDG_CACHE_HOME:-$HOME/.cache}/omarchy/ostat-menus/pycache"
+
+python3 -m compileall -q sensors.py tests
+python3 -m unittest discover -s tests -t . "${@:---quiet}"
+
+if command -v node >/dev/null 2>&1; then
+  node --test tests/
+else
+  echo "node not found; skipping Model.js tests"
+fi
+
+# qmllint needs the shell's `qs.*` modules; a scratch import root maps the
+# prefix onto the installed shell. Runtime-only types (PanelWindow) and the
+# facade-injected properties are expected noise and are switched off.
+QMLLINT=/usr/lib/qt6/bin/qmllint
+if [[ -x $QMLLINT && -d /usr/share/omarchy/shell ]]; then
+  lintroot=$(mktemp -d)
+  ln -s /usr/share/omarchy/shell "$lintroot/qs"
+  "$QMLLINT" -I "$lintroot" -I /usr/lib/qt6/qml \
+    --unqualified disable --unused-imports disable --prefer-non-var-properties disable \
+    --signal-handler-parameters disable --missing-property disable --stale-property-read disable \
+    --access-singleton-via-object disable --import disable --uncreatable-type disable \
+    Panel.qml Sparkline.qml MeterBar.qml \
+    2>&1 | grep -E "^(Warning|Error)" | grep -v "incomplete composite" || true
+  rm -rf "$lintroot"
+fi
+
+if command -v omarchy >/dev/null 2>&1; then
+  omarchy plugin validate .
+fi
+
+echo "All checks passed."

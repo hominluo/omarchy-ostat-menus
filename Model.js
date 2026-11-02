@@ -1,7 +1,7 @@
-.pragma library
-
 // Formatting helpers for the Ostat Menus panel. Kept out of the QML so the
 // panel body stays layout, and so the unit rules live in exactly one place.
+// Stateless on purpose: no `.pragma library`, and the guarded `module.exports`
+// at the bottom is what lets tests/model.test.js load it under node.
 
 var KIB = 1024
 
@@ -52,6 +52,26 @@ function rateCompact(value) {
     index++
   }
   return (n < 9.95 ? n.toFixed(1) : Math.round(n).toString()) + units[index]
+}
+
+// /proc/net/dev counts since the interface came up, so a "session" figure has
+// to be measured from a baseline. Keep the baseline while the sampler reports
+// the same interface, and re-take it when the interface changes: a Wi-Fi to
+// Ethernet switch, or a VPN coming up, swaps in a different set of counters.
+function sessionBase(previous, net) {
+  if (!net || !net.iface) return previous || null
+  if (!previous || previous.iface !== net.iface) {
+    return { iface: net.iface, rx: num(net.rxTotal), tx: num(net.txTotal) }
+  }
+  return previous
+}
+
+function sessionTotals(base, net) {
+  if (!base || !net) return { rx: 0, tx: 0 }
+  return {
+    rx: Math.max(0, num(net.rxTotal) - num(base.rx)),
+    tx: Math.max(0, num(net.txTotal) - num(base.tx)),
+  }
 }
 
 // Footer label for the configured monitor command: the program it runs,
@@ -163,4 +183,16 @@ function maxOf(values, floor) {
     if (v > top) top = v
   }
   return top
+}
+
+// QML imports this file directly; node's test runner needs a CommonJS handle.
+if (typeof module !== "undefined") {
+  module.exports = {
+    clamp: clamp, num: num, bytes: bytes, rate: rate, rateCompact: rateCompact,
+    sessionBase: sessionBase, sessionTotals: sessionTotals, monitorName: monitorName,
+    percent: percent, temperature: temperature, frequency: frequency, duration: duration,
+    loadText: loadText, shortCpuModel: shortCpuModel, processName: processName,
+    fraction: fraction, severity: severity, tempSeverity: tempSeverity,
+    pushSample: pushSample, maxOf: maxOf,
+  }
 }

@@ -11,11 +11,13 @@ of the parts nobody is looking at:
 
     interval <seconds>   change the sampling period (0.25 .. 60)
     detail <0|1>         include the expensive fields (process table, mount
-                         usage, per-core temperatures) or skip them
+                         usage, the full temperature list, fans) or skip them
 
 `detail 0` is the closed-panel mode. The bar itself only renders the cheap
 aggregate fields, and walking every /proc/<pid> once a second to feed a panel
 that is not on screen is the one genuinely wasteful thing this script could do.
+With detail off only the sensor chips that can supply a CPU or GPU temperature
+are read, for the same reason: the rest are ACPI calls.
 """
 
 import errno
@@ -41,6 +43,8 @@ REAL_FS = {
 
 # Mount trees that are real filesystems but never interesting as "my disks".
 SKIP_MOUNT_PREFIXES = ("/snap", "/var/lib/docker", "/var/lib/containers", "/run")
+# ... except where udisks parks removable media, which is a real disk.
+KEEP_MOUNT_PREFIXES = ("/run/media/",)
 
 # Block devices that are not physical disks. zram is compressed RAM and
 # already shows up under swap; counting its I/O as disk traffic is a lie.
@@ -51,7 +55,9 @@ def read_text(path, default=""):
     try:
         with open(path, "r") as handle:
             return handle.read()
-    except OSError:
+    except (OSError, UnicodeError):
+        # UnicodeError as well as OSError: one driver or /proc line that is not
+        # valid UTF-8 must not take the sampler — and with it the widget — down.
         return default
 
 
@@ -92,8 +98,16 @@ def read_cpu_times():
         if not line.startswith("cpu"):
             break
         parts = line.split()
+        try:
+            values = [int(v) for v in parts[1:]]
+        except ValueError:
+            continue
+        # user nice system idle [iowait ...]. A truncated line used to raise
+        # IndexError out of main(), which the widget answers by restarting the
+        # sampler — and killing it again on the next tick.
+        if len(values) < 4:
+            continue
         key = parts[0]
-        values = [int(v) for v in parts[1:]]
         # user nice system idle iowait irq softirq steal guest guest_nice.
         # Idle time is idle + iowait; guest time is already counted inside
         # user/nice, so summing every field would double-count it.
@@ -199,7 +213,10 @@ def net_counters():
         parts = rest.split()
         if len(parts) < 9:
             continue
-        per_iface[name] = (int(parts[0]), int(parts[8]))
+        try:
+            per_iface[name] = (int(parts[0]), int(parts[8]))
+        except ValueError:
+            continue
     return per_iface
 
 
@@ -220,15 +237,32 @@ def disk_counters():
         # have a /sys/block entry of their own.
         if not os.path.isdir(f"/sys/block/{name}"):
             continue
-        read_sectors += int(parts[5])
-        write_sectors += int(parts[9])
+        try:
+            read = int(parts[5])
+            written = int(parts[9])
+        except ValueError:
+            continue
+        read_sectors += read
+        write_sectors += written
     return read_sectors * SECTOR_SIZE, write_sectors * SECTOR_SIZE
 
 
+def skipped_mount(target):
+    """True for real filesystems that are not "my disks".
+
+    Prefixes match on a path boundary, so "/run" hides /run and /run/user but
+    not /run/media/<user>/<label>, which is where udisks mounts a USB stick.
+    """
+    if target.startswith(KEEP_MOUNT_PREFIXES):
+        return False
+    for prefix in SKIP_MOUNT_PREFIXES:
+        if target == prefix or target.startswith(prefix + "/"):
+            return True
+    return False
+
+
 def mounts():
-    seen = set()
-    seen_pools = set()
-    out = []
+    seen_pools = {}
     for line in read_text("/proc/self/mountinfo").splitlines():
         head, _, tail = line.partition(" - ")
         if not tail:
@@ -242,9 +276,7 @@ def mounts():
         source = tail_parts[1]
         if fstype not in REAL_FS:
             continue
-        if target.startswith(SKIP_MOUNT_PREFIXES):
-            continue
-        if target in seen:
+        if skipped_mount(target):
             continue
         try:
             st = os.statvfs(target)
@@ -259,21 +291,22 @@ def mounts():
         # Btrfs subvolumes and bind mounts are separate mountinfo entries that
         # all report the same pool. Listing /, /home, /var/log and
         # /var/cache/pacman/pkg with four identical bars says nothing; keep the
-        # shortest path per pool, which mountinfo order makes the first seen.
+        # shortest path per pool. mountinfo order is not a promise — this used
+        # to keep whatever came first — so a later, shorter path replaces the
+        # incumbent.
         pool = (source, total, free)
-        if pool in seen_pools:
+        kept = seen_pools.get(pool)
+        if kept is not None and len(kept["path"]) <= len(target):
             continue
-        seen_pools.add(pool)
-        seen.add(target)
-        out.append({
+        seen_pools[pool] = {
             "path": target,
             "device": source,
             "fstype": fstype,
             "total": total,
             "used": max(0, total - free),
             "free": free,
-        })
-    out.sort(key=lambda m: (len(m["path"]), m["path"]))
+        }
+    out = sorted(seen_pools.values(), key=lambda m: (len(m["path"]), m["path"]))
     return out[:6]
 
 
@@ -292,10 +325,22 @@ def hwmon_chips():
     return chips
 
 
+# Chip names that label a package sensor: "Package id 0", "Tctl", "Tdie".
+PACKAGE_CHIPS = ("coretemp", "k10temp", "zenpower")
+# Readings that can stand in for the package temperature when nothing labels
+# one. These, plus the GPU chips, are also the only chips worth reading with
+# detail off: on a laptop everything else (nvme, BAT0, ucsi, iwlwifi,
+# dell_smm) goes through ACPI or SMM and costs more per tick than the whole
+# process walk this script exists to avoid.
+CPU_CHIPS = PACKAGE_CHIPS + ("acpitz",)
+GPU_CHIPS = ("amdgpu", "nouveau", "nvidia", "i915", "xe")
+
+
 def sensors(detail):
     temps = []
     fans = []
     cpu_temp = None
+    cpu_temp_from = None
     gpu_temp = None
 
     # Readings that can stand in for the package temperature when no chip
@@ -304,6 +349,8 @@ def sensors(detail):
     cpu_candidates = []
 
     for name, path in hwmon_chips():
+        if not detail and name not in CPU_CHIPS and name not in GPU_CHIPS:
+            continue
         try:
             files = os.listdir(path)
         except OSError:
@@ -319,13 +366,19 @@ def sensors(detail):
                 # sensor is unpopulated; neither is worth showing.
                 if not (-40.0 < value < 150.0):
                     continue
-                label = read_text(f"{path}/{fname[:-6]}_label").strip() or name or fname
+                index = fname[4:-6]
+                # A chip with no per-input label (dell_smm, some boards) used to
+                # fall back to the bare chip name, which printed one identical
+                # row per input; carry the input number instead.
+                label = (read_text(f"{path}/{fname[:-6]}_label").strip()
+                         or f"{name or 'sensor'} {index}")
                 is_package = label.lower().startswith(("package", "tctl", "tdie", "cpu"))
-                if name in ("coretemp", "k10temp", "zenpower") and cpu_temp is None and is_package:
+                if name in PACKAGE_CHIPS and cpu_temp is None and is_package:
                     cpu_temp = value
-                if name in ("amdgpu", "nouveau", "nvidia", "i915", "xe") and gpu_temp is None:
+                    cpu_temp_from = "package"
+                if name in GPU_CHIPS and gpu_temp is None:
                     gpu_temp = value
-                if name in ("coretemp", "k10temp", "zenpower", "acpitz"):
+                if name in CPU_CHIPS:
                     cpu_candidates.append(value)
                 if detail:
                     temps.append({"chip": name, "label": label, "value": value})
@@ -338,11 +391,14 @@ def sensors(detail):
                 fans.append({"chip": name, "label": label, "value": rpm})
 
     # No labelled package sensor: fall back to the hottest core-ish reading so
-    # the hero still has a temperature to show.
+    # the hero still has a temperature to show. The panel needs to know which
+    # of the two it got, or it calls a chassis zone a package.
     if cpu_temp is None and cpu_candidates:
         cpu_temp = max(cpu_candidates)
+        cpu_temp_from = "max"
 
-    return {"cpuTemp": cpu_temp, "gpuTemp": gpu_temp, "temps": temps[:12], "fans": fans[:6]}
+    return {"cpuTemp": cpu_temp, "cpuTempFrom": cpu_temp_from,
+            "gpuTemp": gpu_temp, "temps": temps[:12], "fans": fans[:6]}
 
 
 # ---------------------------------------------------------------- gpu

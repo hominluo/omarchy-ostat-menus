@@ -38,6 +38,10 @@ Panel {
   property bool connected: false
   property string sensorError: ""
   property string processSort: "cpu"
+  // Baseline for the "Session" traffic figures: /proc/net/dev counts since the
+  // interface came up, not since this panel did. Model.sessionBase() re-takes
+  // it when the sampler starts reporting a different interface.
+  property var netBase: null
 
   property var cpuHistory: []
   property var memHistory: []
@@ -67,6 +71,8 @@ Panel {
   readonly property var fans: sample.fans || []
   readonly property var processRows: (processSort === "mem" ? sample.procMem : sample.procCpu) || []
   readonly property real cpuTemp: sample.cpuTemp === null || sample.cpuTemp === undefined ? -1 : Number(sample.cpuTemp)
+  readonly property bool cpuTempIsPackage: sample.cpuTempFrom === "package"
+  readonly property var session: Model.sessionTotals(netBase, sample.net)
 
   // ------------------------------------------------------------- sampling
 
@@ -100,6 +106,7 @@ Panel {
     connected = true
     sensorError = ""
     sample = payload
+    netBase = Model.sessionBase(netBase, payload.net)
 
     cpuHistory = Model.pushSample(cpuHistory, payload.cpu, historySize)
     memHistory = Model.pushSample(memHistory, Model.fraction(payload.mem ? payload.mem.used : 0,
@@ -176,6 +183,22 @@ Panel {
     panelFlick.contentY = Math.max(0, Math.min(maxY, panelFlick.contentY + steps * Style.space(48)))
   }
 
+  // The plugin facade hands out showTooltip() but nothing that replaces the text
+  // of a bubble that is already up. Calling showTooltip() again would work, but
+  // it hides the bubble and re-runs the 400ms reveal, so the tooltip would
+  // blink on every tick. Walk up to the host bar item and rewrite the string in
+  // place; if the host ever stops exposing it, the tooltip just keeps the
+  // figure it was given on hover, which is the old behaviour.
+  function hostBarForTooltip() {
+    var item = root.parent
+    while (item) {
+      if (item.tooltipText !== undefined && item.tooltipTarget !== undefined)
+        return item
+      item = item.parent
+    }
+    return null
+  }
+
   function openMonitor() {
     if (bar) bar.run(terminalCommand)
     close()
@@ -196,6 +219,14 @@ Panel {
     tooltipText: root.connected
       ? "CPU " + Model.percent(root.cpuValue) + " · MEM " + Model.percent(root.memValue)
       : "System monitor (starting…)"
+    // Bar.showTooltip() copies the text when the pointer arrives, so a tooltip
+    // that tracks a live figure would sit on the value it had at hover-enter.
+    onTooltipTextChanged: {
+      if (!tooltipHovered) return
+      var host = root.hostBarForTooltip()
+      if (host && host.tooltipTarget === button && host.tooltipShown)
+        host.tooltipText = tooltipText
+    }
     onPressed: function(buttonCode) {
       if (buttonCode === Qt.RightButton) root.openMonitor()
       else root.toggle()
@@ -650,7 +681,10 @@ Panel {
                 anchors.right: parent.right
                 visible: root.cpuTemp >= 0
                 textFormat: Text.PlainText
-                text: Model.temperature(root.cpuTemp) + " package"
+                // "package" only when a chip actually labelled one; the
+                // fallback is the hottest core or chassis zone.
+                text: Model.temperature(root.cpuTemp)
+                  + (root.cpuTempIsPackage ? " package" : " max")
                 color: root.foreground
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.bodySmall
@@ -802,7 +836,7 @@ Panel {
 
           InfoLine {
             label: "Session"
-            value: "󰇚 " + Model.bytes(root.netInfo.rxTotal) + "   󰕒 " + Model.bytes(root.netInfo.txTotal)
+            value: "󰇚 " + Model.bytes(root.session.rx) + "   󰕒 " + Model.bytes(root.session.tx)
           }
 
           // ---------------------------------------------------------- disk
